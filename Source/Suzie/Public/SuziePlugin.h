@@ -28,6 +28,7 @@ private:
     static TSet<FString> ParseFlags(const FString& Flags);
 
     void AddPropertyToClass(const TSharedPtr<FJsonObject>& Objects, UClass* Class, const TSharedPtr<FJsonObject>& PropertyJson);
+    void AddFunctionToClass(const TSharedPtr<FJsonObject>& Objects, UClass* Class, FString FunctionPath, const TSharedPtr<FJsonObject>& FunctionJson);
 
     FProperty* BuildProperty(const TSharedPtr<FJsonObject>& Objects, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson);
 

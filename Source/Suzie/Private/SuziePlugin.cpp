@@ -116,6 +116,11 @@ UClass* FSuziePluginModule::GetUnregisteredClass(const TSharedPtr<FJsonObject>& 
     FString ClassName;
     ParseObjectPath(ClassPath, PackageName, ClassName);
 
+    EClassFlags ClassFlags = CLASS_Intrinsic;
+
+    TSet<FString> FFlags = ParseFlags(ClassDefinition->GetStringField(TEXT("class_flags")));
+    if (FFlags.Contains(FString(TEXT("CLASS_Interface")))) ClassFlags |= CLASS_Interface;
+
     //Code below is taken from GetPrivateStaticClassBody
     //Allocate memory from ObjectAllocator for class object and call class constructor directly
     UClass* ConstructedClassObject = static_cast<UClass*>(GUObjectAllocator.AllocateUObject(sizeof(UClass), alignof(UClass), true));
@@ -124,7 +129,7 @@ UClass* FSuziePluginModule::GetUnregisteredClass(const TSharedPtr<FJsonObject>& 
         *ClassName,
         ParentClass->GetStructureSize(),
         ParentClass->GetMinAlignment(),
-        CLASS_Intrinsic,
+        ClassFlags,
         CASTCLASS_None,
         UObject::StaticConfigName(),
         RF_Public | RF_Standalone | RF_Transient | RF_MarkAsNative | RF_MarkAsRootSet,
@@ -179,6 +184,18 @@ UClass* FSuziePluginModule::GetRegisteredClass(const TSharedPtr<FJsonObject>& Ob
     for (auto Prop : Properties)
     {
         FSuziePluginModule::AddPropertyToClass(Objects, NewClass, Prop->AsObject());
+    }
+
+    // Add functions to class
+    TArray<TSharedPtr<FJsonValue>> Children = ClassDefinition->GetArrayField(TEXT("children"));
+    for (auto Child : Children)
+    {
+        FString ChildPath = Child->AsString();
+        TSharedPtr<FJsonObject> ChildObject = Objects->GetObjectField(ChildPath);
+        if (ChildObject->GetStringField(TEXT("type")) == "Function")
+        {
+            FSuziePluginModule::AddFunctionToClass(Objects, NewClass, ChildPath, ChildObject);
+        }
     }
 
     // NewClass has since been constructed so don't do it again (TODO can this happen?)
@@ -237,6 +254,65 @@ void FSuziePluginModule::AddPropertyToClass(const TSharedPtr<FJsonObject>& Objec
         
         UE_LOG(LogSuzie, Display, TEXT("Added property %s to class %s"), *NewProperty->GetName(), *Class->GetName());
     }
+}
+
+void FSuziePluginModule::AddFunctionToClass(const TSharedPtr<FJsonObject>& Objects, UClass* Class, FString FunctionPath, const TSharedPtr<FJsonObject>& FunctionJson)
+{
+    FString PackageName;
+    FString ObjectName;
+    ParseObjectPath(FunctionPath, PackageName, ObjectName);
+
+    EFunctionFlags FunctionFlags = FUNC_Public | FUNC_BlueprintCallable | FUNC_Native;
+    
+    TSet<FString> FFlags = ParseFlags(FunctionJson->GetStringField(TEXT("function_flags")));
+    if (FFlags.Contains(FString(TEXT("FUNC_BlueprintPure")))) FunctionFlags |= FUNC_BlueprintPure;
+    if (FFlags.Contains(FString(TEXT("FUNC_Const")))) FunctionFlags |= FUNC_Const;
+    if (FFlags.Contains(FString(TEXT("FUNC_Final")))) FunctionFlags |= FUNC_Final;
+
+    UFunction* NewFunction = NewObject<UFunction>(Class, *ObjectName, RF_Public | RF_Standalone);
+    NewFunction->FunctionFlags = FunctionFlags;
+    NewFunction->SetNativeFunc(
+        [](UObject* Context, FFrame& Stack, void* const Z_Param__Result)
+        {
+            UE_LOG(LogSuzie, Display, TEXT("Dynamic function called"));
+            P_FINISH;
+        }
+    );
+
+    TArray<TSharedPtr<FJsonValue>> Properties = FunctionJson->GetArrayField(TEXT("properties"));
+    for (auto Prop : Properties)
+    {
+        TSharedPtr<FJsonObject> PropertyJson = Prop->AsObject();
+        if (FProperty* NewProperty = BuildProperty(Objects, NewFunction, PropertyJson))
+        {
+            TSet<FString> PropertyFlags = ParseFlags(PropertyJson->GetStringField(TEXT("flags")));
+
+            NewProperty->PropertyFlags |= CPF_NativeAccessSpecifierPublic;
+
+            if (PropertyFlags.Contains(FString(TEXT("CPF_Parm")))) NewProperty->PropertyFlags |= CPF_Parm;
+            if (PropertyFlags.Contains(FString(TEXT("CPF_OutParm")))) NewProperty->PropertyFlags |= CPF_OutParm;
+            if (PropertyFlags.Contains(FString(TEXT("CPF_ReturnParm")))) NewProperty->PropertyFlags |= CPF_ReturnParm;
+            if (PropertyFlags.Contains(FString(TEXT("CPF_ReferenceParm")))) NewProperty->PropertyFlags |= CPF_ReferenceParm;
+            
+            NewProperty->Next = NewFunction->ChildProperties;
+            NewFunction->ChildProperties = NewProperty;
+            
+            UE_LOG(LogSuzie, Display, TEXT("Added function parm %s"), *NewProperty->GetName());
+        }
+    }
+
+    NewFunction->RegisterDependencies();
+
+    NewFunction->Next = Class->Children;
+    Class->Children = NewFunction;
+    
+    Class->AddNativeFunction(*ObjectName, NewFunction->GetNativeFunc());
+    Class->AddFunctionToFunctionMap(NewFunction, FName(*ObjectName));
+
+    NewFunction->Bind();
+    NewFunction->StaticLink(true);
+
+    UE_LOG(LogSuzie, Display, TEXT("Added function %s to class %s"), *ObjectName, *Class->GetName());
 }
 
 FProperty* FSuziePluginModule::BuildProperty(const TSharedPtr<FJsonObject>& Objects, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson)
