@@ -21,6 +21,8 @@ private:
 
     UClass* GetUnregisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath);
     UClass* GetRegisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath);
+    
+    UScriptStruct* GetStruct(const TSharedPtr<FJsonObject>& Objects, const FString& StructPath);
 
     void ProcessAllJsonClassDefinitions();
 

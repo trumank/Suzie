@@ -91,6 +91,11 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
                 UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
                 FSuziePluginModule::GetRegisteredClass(*Objects, ObjectPath);
             }
+            else if (Type == "ScriptStruct")
+            {
+                UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
+                FSuziePluginModule::GetStruct(*Objects, ObjectPath);
+            }
         }
     }
     
@@ -220,6 +225,61 @@ UClass* FSuziePluginModule::GetRegisteredClass(const TSharedPtr<FJsonObject>& Ob
     return NewClass;
 }
 
+UScriptStruct* FSuziePluginModule::GetStruct(const TSharedPtr<FJsonObject>& Objects, const FString& StructPath)
+{
+    UScriptStruct* NewStruct = FindObject<UScriptStruct>(ANY_PACKAGE, *StructPath);
+    if (NewStruct) return NewStruct;
+    
+    FString PackageName;
+    FString ObjectName;
+    ParseObjectPath(StructPath, PackageName, ObjectName);
+
+    UPackage* Package = CreatePackage(*PackageName);
+
+    TSharedPtr<FJsonObject> StructJson = Objects->GetObjectField(StructPath);
+    
+    NewStruct = NewObject<UScriptStruct>(
+        Package,
+        *ObjectName,
+        RF_Public | RF_Standalone | RF_Transient
+    );
+
+    //NewStruct->StructFlags = static_cast<EStructFlags>(NewStruct->StructFlags | STRUCT_Native);
+    
+    TArray<TSharedPtr<FJsonValue>> Properties = StructJson->GetArrayField(TEXT("properties"));
+    for (auto Prop : Properties)
+    {
+        TSharedPtr<FJsonObject> PropertyJson = Prop->AsObject();
+        if (FProperty* NewProperty = BuildProperty(Objects, NewStruct, PropertyJson))
+        {
+            TSet<FString> PropertyFlags = ParseFlags(PropertyJson->GetStringField(TEXT("flags")));
+
+            NewProperty->PropertyFlags |= CPF_BlueprintVisible | CPF_BlueprintAssignable;
+
+            //if (PropertyFlags.Contains(FString(TEXT("CPF_Parm")))) NewProperty->PropertyFlags |= CPF_Parm;
+            //if (PropertyFlags.Contains(FString(TEXT("CPF_OutParm")))) NewProperty->PropertyFlags |= CPF_OutParm;
+            //if (PropertyFlags.Contains(FString(TEXT("CPF_ReturnParm")))) NewProperty->PropertyFlags |= CPF_ReturnParm;
+            //if (PropertyFlags.Contains(FString(TEXT("CPF_ReferenceParm")))) NewProperty->PropertyFlags |= CPF_ReferenceParm;
+            
+            NewProperty->Next = NewStruct->ChildProperties;
+            NewStruct->ChildProperties = NewProperty;
+        }
+    }
+
+    NewStruct->RegisterDependencies();
+    
+    NewStruct->SetMetaData(FName("Blueprintable"), TEXT("true"));
+    NewStruct->SetMetaData(FName("BlueprintType"), TEXT("true"));
+    
+    NewStruct->Bind();
+    NewStruct->StaticLink(true);
+    
+    NewStruct->AddToRoot();
+    
+    UE_LOG(LogSuzie, Display, TEXT("Created struct: %s"), *ObjectName);
+    return NewStruct;
+}
+
 void FSuziePluginModule::ParseObjectPath(const FString& ObjectPath, FString& OutPackageName, FString& OutObjectName)
 {
     int32 DotPosition = ObjectPath.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
@@ -290,6 +350,7 @@ void FSuziePluginModule::AddFunctionToClass(const TSharedPtr<FJsonObject>& Objec
             NewProperty->PropertyFlags |= CPF_NativeAccessSpecifierPublic;
 
             if (PropertyFlags.Contains(FString(TEXT("CPF_Parm")))) NewProperty->PropertyFlags |= CPF_Parm;
+            if (PropertyFlags.Contains(FString(TEXT("CPF_ConstParm")))) NewProperty->PropertyFlags |= CPF_ConstParm;
             if (PropertyFlags.Contains(FString(TEXT("CPF_OutParm")))) NewProperty->PropertyFlags |= CPF_OutParm;
             if (PropertyFlags.Contains(FString(TEXT("CPF_ReturnParm")))) NewProperty->PropertyFlags |= CPF_ReturnParm;
             if (PropertyFlags.Contains(FString(TEXT("CPF_ReferenceParm")))) NewProperty->PropertyFlags |= CPF_ReferenceParm;
@@ -348,6 +409,15 @@ FProperty* FSuziePluginModule::BuildProperty(const TSharedPtr<FJsonObject>& Obje
         P->PropertyClass = InnerClass;
         NewProperty = P;
     }
+    else if (PropertyType == TEXT("Struct"))
+    {
+        auto P = new FStructProperty(Owner, *PropertyName, RF_Public);
+        if (UScriptStruct* Struct = GetStruct(Objects, PropertyJson->GetStringField(TEXT("struct"))))
+        {
+            P->Struct = Struct;
+            NewProperty = P;
+        }
+    }
     else if (PropertyType == TEXT("Array"))
     {
         auto P = new FArrayProperty(Owner, *PropertyName, RF_Public);
@@ -389,6 +459,10 @@ FProperty* FSuziePluginModule::BuildProperty(const TSharedPtr<FJsonObject>& Obje
     else if (PropertyType == TEXT("Int"))
     {
         NewProperty = new FIntProperty(Owner, *PropertyName, RF_Public);
+    }
+    else if (PropertyType == TEXT("UInt32"))
+    {
+        NewProperty = new FUInt32Property(Owner, *PropertyName, RF_Public);
     }
     else if (PropertyType == TEXT("Str"))
     {
