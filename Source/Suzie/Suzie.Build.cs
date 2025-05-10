@@ -21,12 +21,18 @@ public class Suzie : ModuleRules
 			new string[]
 			{
 				"CoreUObject",
+				"DeveloperSettings",
 				"Engine",
 				"Blutility",
 				"Json",
 				"UnrealEd",
 				"Projects",
-			}
+				"Slate",
+				"SlateCore",
+				"EditorStyle",
+				"InputCore",
+				"ToolMenus",
+				"PropertyEditor"}
 			);
 
 		DynamicallyLoadedModuleNames.AddRange(new string[] {});

@@ -12,32 +12,196 @@
 #include "UObject/PropertyPortFlags.h"
 #include "HAL/PlatformFileManager.h"
 #include "Editor/EditorEngine.h"
+#include "Editor.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Engine/EngineTypes.h"
 #include "PropertyEditorModule.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "UObject/UObjectAllocator.h"
+#include "Settings/SuzieSettings.h"
+#include "SuzieStyle.h"
+#include "SuzieSettingsUI.h"
+#include "SuzieUICommands.h"
+#include "LevelEditor.h"
+#include "ToolMenus.h"
 
 DEFINE_LOG_CATEGORY(LogSuzie);
+
+static const FName SuzieSettingsTabName(TEXT("SuzieSettings"));
 
 #define LOCTEXT_NAMESPACE "FSuziePluginModule"
 
 void FSuziePluginModule::StartupModule()
 {
-    UE_LOG(LogSuzie, Display, TEXT("Suzie plugin starting"));
+    // Set up the custom config path for the Suzie plugin
+    FString PluginConfigDir = FPaths::ProjectPluginsDir() / TEXT("Suzie/Config/");
+    if (!FPaths::DirectoryExists(PluginConfigDir))
+    {
+        FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*PluginConfigDir);
+    }
+    FString SuzieConfigFile = GetConfigFilePath();
+    GConfig->LoadFile(*SuzieConfigFile);
+    
+    // Load settings
+    Settings = GetMutableDefault<USuzieSettings>();
+    check(Settings);
 
+    // Make sure the settings are loaded from config
+    Settings->LoadConfig(nullptr, *SuzieConfigFile);
+    
+    // Initialize style
+    FSuzieStyle::Initialize();
+    FSuzieStyle::ReloadTextures();
+    
+    // Register commands
+    FSuzieUICommands::Register();
+    
+    // Initialize command list
+    PluginCommands = MakeShareable(new FUICommandList());
+    
+    PluginCommands->MapAction(
+        FSuzieUICommands::Get().OpenSettings,
+        FExecuteAction::CreateLambda([]() {
+            FGlobalTabmanager::Get()->TryInvokeTab(FName("SuzieSettings"));
+        }),
+        FCanExecuteAction());
+    
+    // Register in Level Editor toolbar
+    FLevelEditorModule& LevelEditorModule = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
+    
+    // Add toolbar button extension
+    TSharedPtr<FExtender> ToolbarExtender = MakeShareable(new FExtender);
+    ToolbarExtender->AddToolBarExtension(
+        TEXT("Play"),
+        EExtensionHook::After,
+        PluginCommands,
+        FToolBarExtensionDelegate::CreateLambda([](FToolBarBuilder& Builder) {
+            Builder.AddToolBarButton(
+                FSuzieUICommands::Get().OpenSettings,
+                NAME_None,
+                LOCTEXT("SuzieButtonLabel", "Suzie"),
+                LOCTEXT("SuzieButtonTooltip", "Open Suzie Settings"),
+                FSlateIcon(FSuzieStyle::GetStyleSetName(), "Suzie.PluginIcon")
+            );
+        }));
+    LevelEditorModule.GetToolBarExtensibilityManager()->AddExtender(ToolbarExtender);
+
+    // Register settings tab spawner
+    FGlobalTabmanager::Get()->RegisterNomadTabSpawner(SuzieSettingsTabName,
+        FOnSpawnTab::CreateLambda([](const FSpawnTabArgs&) {
+            return SNew(SDockTab)
+                .TabRole(ETabRole::NomadTab)
+                .Label(LOCTEXT("SuzieSettingsTabTitle", "Suzie Settings"))
+                [SNew(SSuzieSettingsUI)];
+        }))
+        .SetDisplayName(LOCTEXT("SuzieSettingsTabTitle", "Suzie Settings"))
+        .SetMenuType(ETabSpawnerMenuType::Hidden);
+
+    // Process JSON class definitions
     ProcessAllJsonClassDefinitions();
 }
 
+
+
 void FSuziePluginModule::ShutdownModule()
 {
-    UE_LOG(LogSuzie, Display, TEXT("Suzie plugin shutting down"));
+    // Unregister tab spawner
+    FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(FName("SuzieSettings"));
+    
+    // Unregister style
+    FSuzieStyle::Shutdown();
+    
+    // Unregister commands
+    FSuzieUICommands::Unregister();
+}
+
+bool FSuziePluginModule::ProcessJsonFile(const FString& JsonFilePath)
+{
+    // Read the JSON file
+    FString JsonContent;
+    if (!FFileHelper::LoadFileToString(JsonContent, *JsonFilePath))
+    {
+        UE_LOG(LogSuzie, Error, TEXT("Failed to read JSON file: %s"), *JsonFilePath);
+        return false;
+    }
+
+    // Parse the JSON
+    TSharedPtr<FJsonObject> JsonObject;
+    TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonContent);
+    if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
+    {
+        UE_LOG(LogSuzie, Error, TEXT("Failed to parse JSON in file: %s"), *JsonFilePath);
+        return false;
+    }
+
+    const TSharedPtr<FJsonObject>* Objects;
+    if (!JsonObject->TryGetObjectField(TEXT("objects"), Objects))
+    {
+        UE_LOG(LogSuzie, Error, TEXT("Missing 'objects' map"));
+        return false;
+    }
+
+    // Create classes
+    for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
+    {
+        FString ObjectPath = It.Key();
+        FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
+        if (Type == "Class")
+        {
+            UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
+            GetRegisteredClass(*Objects, ObjectPath);
+        }
+        else if (Type == "ScriptStruct")
+        {
+            UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
+            GetStruct(*Objects, ObjectPath);
+        }
+    }
+    
+    return true;
 }
 
 void FSuziePluginModule::ProcessAllJsonClassDefinitions()
 {
-    // Define where we expect JSON class definitions to be
-    FString JsonClassesPath = FPaths::ProjectContentDir() / TEXT("DynamicClasses");
+    // Clear any pending classes from previous runs
+    PendingDynamicClasses.Empty();
+    PendingConstruction.Empty();
+    
+    // Get the directory path from settings
+    FString JsonClassesPath;
+    if (Settings)
+    {
+        // Use the full path provided in settings instead of making it relative to content dir
+        JsonClassesPath = Settings->JsonClassesDirectory.Path.TrimStartAndEnd();
+    }
+    else
+    {
+        // Default to project content dir if no settings are available
+        JsonClassesPath = FPaths::ProjectContentDir() / TEXT("DynamicClasses");
+    }
+    
+    UE_LOG(LogSuzie, Display, TEXT("JSON Classes Path: %s"), *JsonClassesPath);
+    
+    // Log the status of settings values for diagnostic purposes
+    if (Settings)
+    {
+        UE_LOG(LogSuzie, Display, TEXT("Processing JSONs with the following settings:"));
+        UE_LOG(LogSuzie, Display, TEXT("Load All Files: %s"), Settings->bLoadAllFiles ? TEXT("Yes") : TEXT("No"));
+        UE_LOG(LogSuzie, Display, TEXT("JSON Files Count: %d"), Settings->JsonFiles.Num());
+        
+        // Count selected files for logging
+        int32 SelectedCount = 0;
+        for (const FJsonFileConfig& FileConfig : Settings->JsonFiles)
+        {
+            if (FileConfig.bSelected)
+            {
+                SelectedCount++;
+                UE_LOG(LogSuzie, Display, TEXT("Selected JSON File: %s"), *FileConfig.FilePath.FilePath);
+            }
+        }
+        
+        UE_LOG(LogSuzie, Display, TEXT("Selected Files Count: %d"), SelectedCount);
+    }
     
     // Check if directory exists
     if (!FPlatformFileManager::Get().GetPlatformFile().DirectoryExists(*JsonClassesPath))
@@ -46,61 +210,105 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         return;
     }
     
-    // Find all JSON files
+    // Collect JSON files to process
     TArray<FString> JsonFiles;
-    FPlatformFileManager::Get().GetPlatformFile().FindFiles(JsonFiles, *JsonClassesPath, TEXT("json"));
     
-    UE_LOG(LogSuzie, Display, TEXT("Found %d JSON class definition files"), JsonFiles.Num());
-    
-    // Process each JSON file
-    for (const FString& JsonFilePath : JsonFiles)
+    if (Settings && Settings->bLoadAllFiles)
     {
-        UE_LOG(LogSuzie, Display, TEXT("Processing JSON class definition: %s"), *JsonFilePath);
-    
-        // Read the JSON file
-        FString JsonContent;
-        if (!FFileHelper::LoadFileToString(JsonContent, *JsonFilePath))
+        // Find all JSON files in the directory
+        TArray<FString> AllJsonFiles;
+        FPlatformFileManager::Get().GetPlatformFile().FindFiles(AllJsonFiles, *JsonClassesPath, TEXT("json"));
+        
+        for (const FString& JsonFilePath : AllJsonFiles)
         {
-            UE_LOG(LogSuzie, Error, TEXT("Failed to read JSON file: %s"), *JsonFilePath);
-            return;
-        }
-    
-        // Parse the JSON
-        TSharedPtr<FJsonObject> JsonObject;
-        TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonContent);
-        if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
-        {
-            UE_LOG(LogSuzie, Error, TEXT("Failed to parse JSON in file: %s"), *JsonFilePath);
-            continue;
-        }
-
-        const TSharedPtr<FJsonObject>* Objects;
-        if (!JsonObject->TryGetObjectField(TEXT("objects"), Objects))
-        {
-            UE_LOG(LogSuzie, Error, TEXT("Missing 'objects' map"));
-            continue;
-        }
-
-        // Create classes
-        for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
-        {
-            FString ObjectPath = It.Key();
-            FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
-            if (Type == "Class")
+            UE_LOG(LogSuzie, Display, TEXT("Processing JSON class definition: %s"), *JsonFilePath);
+            if (ProcessJsonFile(JsonFilePath))
             {
-                UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
-                FSuziePluginModule::GetRegisteredClass(*Objects, ObjectPath);
-            }
-            else if (Type == "ScriptStruct")
-            {
-                UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
-                FSuziePluginModule::GetStruct(*Objects, ObjectPath);
+                JsonFiles.Add(JsonFilePath);
             }
         }
+        UE_LOG(LogSuzie, Display, TEXT("Found %d JSON class definition files"), JsonFiles.Num());
+    }
+    else if (Settings && Settings->JsonFiles.Num() > 0)
+    {
+        // Process the selected JSON files from settings
+        int32 ProcessedCount = 0;
+        
+        for (const FJsonFileConfig& FileConfig : Settings->JsonFiles)
+        {
+            // Skip files that aren't selected
+            if (!FileConfig.bSelected)
+            {
+                continue;
+            }
+            
+            FString JsonFilePath;
+            
+            // Get file name for path construction if needed
+            FString FileName = FPaths::GetCleanFilename(FileConfig.FilePath.FilePath);
+            
+            // If it's just a file name without path, combine with JsonClassesPath
+            if (FileConfig.FilePath.FilePath == FileName)
+            {
+                JsonFilePath = FPaths::Combine(JsonClassesPath, FileName);
+            }
+            else
+            {
+                // Handle paths properly based on whether they're relative or absolute
+                if (FPaths::IsRelative(FileConfig.FilePath.FilePath))
+                {
+                    // Only append to ProjectContentDir if it's relative
+                    JsonFilePath = FPaths::ConvertRelativePathToFull(FPaths::ProjectContentDir() / FileConfig.FilePath.FilePath);
+                }
+                else
+                {
+                    // Already absolute path, just use it directly
+                    JsonFilePath = FileConfig.FilePath.FilePath;
+                }
+            }
+            
+            UE_LOG(LogSuzie, Display, TEXT("Processing JSON class definition: %s"), *JsonFilePath);
+            
+            // Continue with processing the file
+            if (ProcessJsonFile(JsonFilePath))
+            {
+                JsonFiles.Add(JsonFilePath);
+                ProcessedCount++;
+            }
+        }
+        
+        UE_LOG(LogSuzie, Display, TEXT("Processing %d selected JSON class definition files"), ProcessedCount);
+    }
+    else
+    {
+        UE_LOG(LogSuzie, Display, TEXT("No JSON files selected for processing. Open the Suzie Settings to select files."));
     }
     
     // After all classes are created, finalize them
     FinalizeAllDynamicClasses();
+    
+    // Open settings tab automatically on first launch if no JSON files are selected
+    bool bHasSelectedFiles = false;
+    if (Settings && Settings->JsonFiles.Num() > 0)
+    {
+        for (const FJsonFileConfig& FileConfig : Settings->JsonFiles)
+        {
+            if (FileConfig.bSelected)
+            {
+                bHasSelectedFiles = true;
+                break;
+            }
+        }
+    }
+    
+    if (Settings && !Settings->bLoadAllFiles && !bHasSelectedFiles)
+    {
+        // We need to defer this to avoid trying to open it while the UI is still initializing
+        FTimerHandle OpenSettingsTimerHandle;
+        GEditor->GetTimerManager()->SetTimer(OpenSettingsTimerHandle, []() {
+            FGlobalTabmanager::Get()->TryInvokeTab(FName("SuzieSettings"));
+        }, 1.0f, false);
+    }
 }
 
 UClass* FSuziePluginModule::GetUnregisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath)
@@ -488,6 +696,12 @@ FProperty* FSuziePluginModule::BuildProperty(const TSharedPtr<FJsonObject>& Obje
                *PropertyType);
     }
     return NewProperty;
+}
+
+FString FSuziePluginModule::GetConfigFilePath() const
+{
+    FString PluginConfigDir = FPaths::ProjectPluginsDir() / TEXT("Suzie/Config/");
+    return PluginConfigDir / TEXT("Suzie.ini");
 }
 
 void FSuziePluginModule::FinalizeAllDynamicClasses()
