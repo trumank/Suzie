@@ -141,20 +141,26 @@ bool FSuziePluginModule::ProcessJsonFile(const FString& JsonFilePath)
         return false;
     }
 
-    // Create classes
-    for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
+    // Create classes from the parsed JSON objects
+    return CreateClassesFromJson(*Objects);
+}
+
+bool FSuziePluginModule::CreateClassesFromJson(const TSharedPtr<FJsonObject>& Objects)
+{
+    // Create classes and structs
+    for (auto It = Objects.Get()->Values.CreateConstIterator(); It; ++It)
     {
         FString ObjectPath = It.Key();
         FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
         if (Type == "Class")
         {
             UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
-            GetRegisteredClass(*Objects, ObjectPath);
+            GetRegisteredClass(Objects, ObjectPath);
         }
         else if (Type == "ScriptStruct")
         {
             UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
-            GetStruct(*Objects, ObjectPath);
+            GetStruct(Objects, ObjectPath);
         }
     }
     

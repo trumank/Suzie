@@ -32,6 +32,7 @@ private:
     TSet<UClass*> PendingConstruction;
     USuzieSettings* Settings = nullptr;
 
+    bool CreateClassesFromJson(const TSharedPtr<FJsonObject>& Objects);
     /** Helper method to process a single JSON file */
     bool ProcessJsonFile(const FString& JsonFilePath);
     UClass* GetUnregisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath);
