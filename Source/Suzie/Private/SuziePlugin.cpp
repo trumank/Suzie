@@ -105,7 +105,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
 
 UClass* FSuziePluginModule::GetUnregisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath)
 {
-    if (UClass* NewClass = FindObject<UClass>(ANY_PACKAGE, *ClassPath)) return NewClass;
+    if (UClass* NewClass = FindObject<UClass>(nullptr, *ClassPath)) return NewClass;
     
     const TSharedPtr<FJsonObject> ClassDefinition = Objects->GetObjectField(ClassPath);
     
@@ -166,7 +166,7 @@ UClass* FSuziePluginModule::GetUnregisteredClass(const TSharedPtr<FJsonObject>& 
 UClass* FSuziePluginModule::GetRegisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath)
 {
     // Return existing class if exists
-    UClass* NewClass = FindObject<UClass>(ANY_PACKAGE, *ClassPath);
+    UClass* NewClass = FindObject<UClass>(nullptr, *ClassPath);
     if (NewClass && !PendingConstruction.Contains(NewClass)) return NewClass;
 
     // Class is not constructed/registered so do so now
@@ -227,7 +227,7 @@ UClass* FSuziePluginModule::GetRegisteredClass(const TSharedPtr<FJsonObject>& Ob
 
 UScriptStruct* FSuziePluginModule::GetStruct(const TSharedPtr<FJsonObject>& Objects, const FString& StructPath)
 {
-    UScriptStruct* NewStruct = FindObject<UScriptStruct>(ANY_PACKAGE, *StructPath);
+    UScriptStruct* NewStruct = FindObject<UScriptStruct>(nullptr, *StructPath);
     if (NewStruct) return NewStruct;
     
     FString PackageName;
@@ -522,4 +522,4 @@ void FSuziePluginModule::FinalizeClass(UClass* Class)
 
 #undef LOCTEXT_NAMESPACE
 
-IMPLEMENT_MODULE(FSuziePluginModule, DynamicReflectionPlugin)
+IMPLEMENT_MODULE(FSuziePluginModule, Suzie)
