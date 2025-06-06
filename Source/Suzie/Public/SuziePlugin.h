@@ -27,6 +27,7 @@ private:
     UClass* FindOrCreateUnregisteredClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UClass* FindOrCreateClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UScriptStruct* FindOrCreateScriptStruct(FDynamicClassGenerationContext& Context, const FString& StructPath);
+    UEnum* FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath);
     void FinalizeClass(UClass* Class);
 
     void ProcessAllJsonClassDefinitions();

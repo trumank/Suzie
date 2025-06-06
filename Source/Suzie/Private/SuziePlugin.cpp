@@ -90,15 +90,20 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         {
             FString ObjectPath = It.Key();
             FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
-            if (Type == "Class")
+            if (Type == TEXT("Class"))
             {
                 UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
                 FindOrCreateClass(ClassGenerationContext, ObjectPath);
             }
-            else if (Type == "ScriptStruct")
+            else if (Type == TEXT("ScriptStruct"))
             {
                 UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
                 FindOrCreateScriptStruct(ClassGenerationContext, ObjectPath);
+            }
+            else if (Type == TEXT("Enum"))
+            {
+                UE_LOG(LogSuzie, Display, TEXT("Creating enum %s"), *ObjectPath);
+                FindOrCreateEnum(ClassGenerationContext, ObjectPath);
             }
             // TODO: Support delegate and multicast delegate properties here (top level functions)
         }
@@ -346,6 +351,64 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     return NewStruct;
 }
 
+UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath)
+{
+     // Check if we have already created this enum
+    if (UEnum* ExistingEnum = FindObject<UEnum>(nullptr, *EnumPath))
+    {
+        return ExistingEnum;
+    }
+
+    const TSharedPtr<FJsonObject> EnumDefinition = Context.GlobalObjectMap->GetObjectField(EnumPath);
+
+    FString PackageName;
+    FString ObjectName;
+    ParseObjectPath(EnumPath, PackageName, ObjectName);
+
+    // Create a package for the struct or reuse the existing package. Make sure it's marked as Native package
+    UPackage* Package = CreatePackage(*PackageName);
+    Package->SetPackageFlags(PKG_CompiledIn);
+    
+    UEnum* NewEnum = NewObject<UEnum>(Package, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
+
+    // Set CppType. It is generally not used by the engine, but is useful to determine whenever enum is namespaced or not for CppForm deduction
+    NewEnum->CppType = EnumDefinition->GetStringField(TEXT("cpp_type"));
+
+    TArray<TPair<FName, int64>> EnumNames;
+    bool bContainsFullyQualifiedNames = false;
+
+    // Parse enum constant names and values
+    TArray<TSharedPtr<FJsonValue>> EnumNameJsonEntries = EnumDefinition->GetArrayField(TEXT("names"));
+    for (const TSharedPtr<FJsonValue>& EnumNameAndValueArrayValue : EnumNameJsonEntries)
+    {
+        const TArray<TSharedPtr<FJsonValue>>& EnumNameAndValueArray = EnumNameAndValueArrayValue->AsArray();
+        if (EnumNameAndValueArray.Num() == 2)
+        {
+            const FString EnumConstantName = EnumNameAndValueArray[0]->AsString();
+            // TODO: Using numbers to represent enumeration values is not safe, large int64 values cannot be adequately represented as json double precision numbers
+            const int64 EnumConstantValue = EnumNameAndValueArray[1]->AsNumber();
+
+            EnumNames.Add({FName(*EnumConstantName), EnumConstantValue});
+            bContainsFullyQualifiedNames |= EnumConstantName.Contains(TEXT("::"));
+        }
+    }
+
+    // TODO: CppForm and Flags are not currently dumped, but we can assume flags None for most enums and guess CppForm based on names and CppType
+    const bool bCppTypeIsNamespaced = NewEnum->CppType.Contains(TEXT("::"));
+    const UEnum::ECppForm EnumCppForm = bContainsFullyQualifiedNames ? (bCppTypeIsNamespaced ? UEnum::ECppForm::Namespaced : UEnum::ECppForm::EnumClass) : UEnum::ECppForm::Regular;
+    const EEnumFlags EnumFlags = EEnumFlags::None;
+
+    // We do not need to generate _MAX key because it will always be present in the enum definition
+    NewEnum->SetEnums(EnumNames, EnumCppForm, EnumFlags, false);
+
+    // Mark all dynamic enums as blueprint types
+    NewEnum->SetMetaData(TEXT("BlueprintType"), TEXT("true"));
+    
+    UE_LOG(LogSuzie, Display, TEXT("Created enum: %s"), *ObjectName);
+
+    return NewEnum;
+}
+
 void FSuziePluginModule::ParseObjectPath(const FString& ObjectPath, FString& OutPackageName, FString& OutObjectName)
 {
     int32 DotPosition = ObjectPath.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
@@ -560,6 +623,7 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         }
     }
     
+    
     FProperty* NewProperty = nullptr;
     
     if (PropertyType == TEXT("Object"))
@@ -654,6 +718,7 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         NewProperty = new FTextProperty(Owner, *PropertyName, RF_Public);
     }
     // TODO: Support delegate and multicast delegate properties here
+    // TODO: A whole bunch of properties are missing (double, numerous integral, optional, interface, etc)
     
     if (NewProperty)
     {
