@@ -7,6 +7,13 @@
 
 DECLARE_LOG_CATEGORY_EXTERN(LogSuzie, Log, All);
 
+struct FDynamicClassGenerationContext
+{
+	TSharedPtr<FJsonObject> GlobalObjectMap;
+    TMap<UClass*, FString> ClassesPendingConstruction;
+    TArray<UClass*> ClassesPendingFinalization;
+};
+
 class FSuziePluginModule : public IModuleInterface
 {
 public:
@@ -16,24 +23,19 @@ public:
 private:
     TSharedPtr<FUICommandList> PluginCommands;
     TSharedPtr<FSlateStyleSet> PluginStyle;
-    TArray<UClass*> PendingDynamicClasses;
-    TSet<UClass*> PendingConstruction;
 
-    UClass* GetUnregisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath);
-    UClass* GetRegisteredClass(const TSharedPtr<FJsonObject>& Objects, const FString& ClassPath);
-    
-    UScriptStruct* GetStruct(const TSharedPtr<FJsonObject>& Objects, const FString& StructPath);
+    UClass* FindOrCreateUnregisteredClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
+    UClass* FindOrCreateClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
+    UScriptStruct* FindOrCreateScriptStruct(FDynamicClassGenerationContext& Context, const FString& StructPath);
+    void FinalizeClass(UClass* Class);
 
     void ProcessAllJsonClassDefinitions();
 
     static void ParseObjectPath(const FString& ObjectPath, FString& OutPackageName, FString& OutObjectName);
     static TSet<FString> ParseFlags(const FString& Flags);
 
-    void AddPropertyToClass(const TSharedPtr<FJsonObject>& Objects, UClass* Class, const TSharedPtr<FJsonObject>& PropertyJson);
-    void AddFunctionToClass(const TSharedPtr<FJsonObject>& Objects, UClass* Class, FString FunctionPath, const TSharedPtr<FJsonObject>& FunctionJson);
+    void AddPropertyToStruct(FDynamicClassGenerationContext& Context, UStruct* Struct, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
+    void AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, const TSharedPtr<FJsonObject>& FunctionJson, EFunctionFlags ExtraFunctionFlags = FUNC_None);
 
-    FProperty* BuildProperty(const TSharedPtr<FJsonObject>& Objects, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson);
-
-    void FinalizeAllDynamicClasses();
-    void FinalizeClass(UClass* Class);
+    FProperty* BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
 };
