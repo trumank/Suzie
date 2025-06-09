@@ -24,19 +24,21 @@ private:
     TSharedPtr<FUICommandList> PluginCommands;
     TSharedPtr<FSlateStyleSet> PluginStyle;
 
+    UPackage* FindOrCreatePackage(FDynamicClassGenerationContext& Context, const FString& PackageName);
     UClass* FindOrCreateUnregisteredClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UClass* FindOrCreateClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UScriptStruct* FindOrCreateScriptStruct(FDynamicClassGenerationContext& Context, const FString& StructPath);
     UEnum* FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath);
+    UFunction* FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath);
     void FinalizeClass(UClass* Class);
 
     void ProcessAllJsonClassDefinitions();
 
-    static void ParseObjectPath(const FString& ObjectPath, FString& OutPackageName, FString& OutObjectName);
+    static void ParseObjectPath(const FString& ObjectPath, FString& OutOuterObjectPath, FString& OutObjectName);
     static TSet<FString> ParseFlags(const FString& Flags);
 
     void AddPropertyToStruct(FDynamicClassGenerationContext& Context, UStruct* Struct, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
-    void AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, const TSharedPtr<FJsonObject>& FunctionJson, EFunctionFlags ExtraFunctionFlags = FUNC_None);
+    void AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, EFunctionFlags ExtraFunctionFlags = FUNC_None);
 
     FProperty* BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
 };

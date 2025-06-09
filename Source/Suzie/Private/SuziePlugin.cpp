@@ -15,6 +15,7 @@
 #include "Framework/Commands/UICommandList.h"
 #include "Engine/EngineTypes.h"
 #include "PropertyEditorModule.h"
+#include "UObject/PropertyOptional.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "UObject/UObjectAllocator.h"
 
@@ -105,7 +106,11 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
                 UE_LOG(LogSuzie, Display, TEXT("Creating enum %s"), *ObjectPath);
                 FindOrCreateEnum(ClassGenerationContext, ObjectPath);
             }
-            // TODO: Support delegate and multicast delegate properties here (top level functions)
+            else if (Type == TEXT("Function"))
+            {
+                UE_LOG(LogSuzie, Display, TEXT("Creating function %s"), *ObjectPath);
+                FindOrCreateFunction(ClassGenerationContext, ObjectPath);
+            }
         }
 
         // Construct classes that have been created but have not been constructed yet due to nobody referencing them
@@ -127,6 +132,17 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
     }
 }
 
+UPackage* FSuziePluginModule::FindOrCreatePackage(FDynamicClassGenerationContext& Context, const FString& PackageName)
+{
+    int32 UnusedCharacterIndex;
+    checkf(!PackageName.FindChar('.', UnusedCharacterIndex) && !PackageName.FindChar(':', UnusedCharacterIndex),
+        TEXT("Invalid package name: %s"), *PackageName);
+    
+    UPackage* Package = CreatePackage(*PackageName);
+    Package->SetPackageFlags(PKG_CompiledIn);
+    return Package;
+}
+
 UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGenerationContext& Context, const FString& ClassPath)
 {
     // Attempt to find an existing class first
@@ -136,6 +152,10 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     }
     
     const TSharedPtr<FJsonObject> ClassDefinition = Context.GlobalObjectMap->GetObjectField(ClassPath);
+    checkf(ClassDefinition.IsValid(), TEXT("Failed to find class object by path %s"), *ClassPath);
+    
+    const FString ObjectType = ClassDefinition->GetStringField(TEXT("type"));
+    checkf(ObjectType == TEXT("Class"), TEXT("FindOrCreateUnregisteredClass expected Class object %s, got object of type %s"), *ClassPath, *ObjectType);
     
     const FString ParentClassPath = ClassDefinition->GetStringField(TEXT("super_struct"));
     UClass* ParentClass = FindOrCreateClass(Context, ParentClassPath);
@@ -148,6 +168,9 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     FString PackageName;
     FString ClassName;
     ParseObjectPath(ClassPath, PackageName, ClassName);
+
+    // DeferredRegister for UClass will automatically find the package by name, but we should still prime it before that
+    FindOrCreatePackage(Context, PackageName);
 
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
     static const TArray<TPair<FString, EClassFlags>> ClassFlagNameLookup = {
@@ -250,10 +273,10 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     for (const TSharedPtr<FJsonValue>& FunctionObjectPathValue : Children)
     {
         FString ChildPath = FunctionObjectPathValue->AsString();
-        TSharedPtr<FJsonObject> ChildObject = Context.GlobalObjectMap->GetObjectField(ChildPath);
+        const TSharedPtr<FJsonObject> ChildObject = Context.GlobalObjectMap->GetObjectField(ChildPath);
         if (ChildObject->GetStringField(TEXT("type")) == "Function")
         {
-            AddFunctionToClass(Context, NewClass, ChildPath, ChildObject);
+            AddFunctionToClass(Context, NewClass, ChildPath);
         }
     }
 
@@ -281,6 +304,10 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     }
 
     const TSharedPtr<FJsonObject> StructDefinition = Context.GlobalObjectMap->GetObjectField(StructPath);
+    checkf(StructDefinition.IsValid(), TEXT("Failed to find script struct object by path %s"), *StructPath);
+    
+    const FString ObjectType = StructDefinition->GetStringField(TEXT("type"));
+    checkf(ObjectType == TEXT("ScriptStruct"), TEXT("FindOrCreateScriptStruct expected ScriptStruct object %s, got object of type %s"), *StructPath, *ObjectType);
 
     // Resolve parent struct for this struct before we attempt to create this struct
     UScriptStruct* SuperScriptStruct = nullptr;
@@ -300,8 +327,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     ParseObjectPath(StructPath, PackageName, ObjectName);
 
     // Create a package for the struct or reuse the existing package. Make sure it's marked as Native package
-    UPackage* Package = CreatePackage(*PackageName);
-    Package->SetPackageFlags(PKG_CompiledIn);
+    UPackage* Package = FindOrCreatePackage(Context, PackageName);
     
     UScriptStruct* NewStruct = NewObject<UScriptStruct>(Package, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
 
@@ -360,14 +386,17 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     }
 
     const TSharedPtr<FJsonObject> EnumDefinition = Context.GlobalObjectMap->GetObjectField(EnumPath);
+    checkf(EnumDefinition.IsValid(), TEXT("Failed to find enum object by path %s"), *EnumPath);
+    
+    const FString ObjectType = EnumDefinition->GetStringField(TEXT("type"));
+    checkf(ObjectType == TEXT("Enum"), TEXT("FindOrCreateEnum expected Enum object %s, got object of type %s"), *EnumPath, *ObjectType);
 
     FString PackageName;
     FString ObjectName;
     ParseObjectPath(EnumPath, PackageName, ObjectName);
 
     // Create a package for the struct or reuse the existing package. Make sure it's marked as Native package
-    UPackage* Package = CreatePackage(*PackageName);
-    Package->SetPackageFlags(PKG_CompiledIn);
+    UPackage* Package = FindOrCreatePackage(Context, PackageName);
     
     UEnum* NewEnum = NewObject<UEnum>(Package, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
 
@@ -409,18 +438,118 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     return NewEnum;
 }
 
-void FSuziePluginModule::ParseObjectPath(const FString& ObjectPath, FString& OutPackageName, FString& OutObjectName)
+UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath)
 {
-    int32 DotPosition = ObjectPath.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-    
-    if (DotPosition != INDEX_NONE)
+    FString ClassPathOrPackageName;
+    FString ObjectName;
+    ParseObjectPath(FunctionPath, ClassPathOrPackageName, ObjectName);
+
+    // Function can be outered either to a class or to a package, we can decide based on whenever there is a separator in the path
+    UObject* FunctionOuterObject;
+    int32 PackageNameSeparatorIndex{};
+    if (ClassPathOrPackageName.FindChar('.', PackageNameSeparatorIndex))
     {
-        OutPackageName = ObjectPath.Left(DotPosition);
-        OutObjectName = ObjectPath.Mid(DotPosition + 1);
+        // This is a class path because it is at least two levels deep. We do not need our outer to be registered, just to exist
+        FunctionOuterObject = FindOrCreateUnregisteredClass(Context, ClassPathOrPackageName);
     }
     else
     {
-        OutPackageName = TEXT("");
+        // This is a package and this function is a top level function (most likely a delegate signature)
+        FunctionOuterObject = FindOrCreatePackage(Context, ClassPathOrPackageName);
+    }
+
+    // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
+    static const TArray<TPair<FString, EFunctionFlags>> FunctionFlagNameLookup = {
+        {TEXT("FUNC_Final"), FUNC_Final},
+        {TEXT("FUNC_BlueprintAuthorityOnly"), FUNC_BlueprintAuthorityOnly},
+        {TEXT("FUNC_BlueprintCosmetic"), FUNC_BlueprintCosmetic},
+        {TEXT("FUNC_Net"), FUNC_Net},
+        {TEXT("FUNC_NetReliable"), FUNC_NetReliable},
+        {TEXT("FUNC_NetRequest"), FUNC_NetRequest},
+        {TEXT("FUNC_Exec"), FUNC_Exec},
+        {TEXT("FUNC_Event"), FUNC_Event},
+        {TEXT("FUNC_NetResponse"), FUNC_NetResponse},
+        {TEXT("FUNC_Static"), FUNC_Static},
+        {TEXT("FUNC_NetMulticast"), FUNC_NetMulticast},
+        {TEXT("FUNC_UbergraphFunction"), FUNC_UbergraphFunction},
+        {TEXT("FUNC_MulticastDelegate"), FUNC_MulticastDelegate},
+        {TEXT("FUNC_Public"), FUNC_Public},
+        {TEXT("FUNC_Private"), FUNC_Private},
+        {TEXT("FUNC_Protected"), FUNC_Protected},
+        {TEXT("FUNC_Delegate"), FUNC_Delegate},
+        {TEXT("FUNC_NetServer"), FUNC_NetServer},
+        {TEXT("FUNC_NetClient"), FUNC_NetClient},
+        {TEXT("FUNC_BlueprintCallable"), FUNC_BlueprintCallable},
+        {TEXT("FUNC_BlueprintEvent"), FUNC_BlueprintEvent},
+        {TEXT("FUNC_BlueprintPure"), FUNC_BlueprintPure},
+        {TEXT("FUNC_EditorOnly"), FUNC_EditorOnly},
+        {TEXT("FUNC_Const"), FUNC_Const},
+        {TEXT("FUNC_NetValidate"), FUNC_NetValidate},
+        {TEXT("FUNC_HasOutParms"), FUNC_HasOutParms},
+        {TEXT("FUNC_HasDefaults"), FUNC_HasDefaults},
+    };
+
+    const TSharedPtr<FJsonObject> FunctionDefinition = Context.GlobalObjectMap->GetObjectField(FunctionPath);
+    checkf(FunctionDefinition.IsValid(), TEXT("Failed to find function object by path %s"), *FunctionPath);
+    
+    const FString ObjectType = FunctionDefinition->GetStringField(TEXT("type"));
+    checkf(ObjectType == TEXT("Function"), TEXT("FindOrCreateFunction expected Function object %s, got object of type %s"), *FunctionPath, *ObjectType);
+    
+    // Convert struct flag names to the struct flags bitmask
+    const TSet<FString> FunctionFlagNames = ParseFlags(FunctionDefinition->GetStringField(TEXT("function_flags")));
+    EFunctionFlags FunctionFlags = FUNC_None;
+    for (const auto& [FunctionFlagName, FunctionFlagBit] : FunctionFlagNameLookup)
+    {
+        if (FunctionFlagNames.Contains(FunctionFlagName))
+        {
+            FunctionFlags |= FunctionFlagBit;
+        }
+    }
+
+    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
+    NewFunction->FunctionFlags |= FunctionFlags;
+
+    // Since this function is not marked as Native, we have to initialize Script bytecode for it
+    // Most basic valid kismet bytecode for a function would be EX_Return EX_Nothing EX_EndOfScript, so generate that
+    NewFunction->Script.Append({EX_Return, EX_Nothing, EX_EndOfScript});
+
+    // Create function parameter properties (and function return value property)
+    TArray<TSharedPtr<FJsonValue>> Properties = FunctionDefinition->GetArrayField(TEXT("properties"));
+    for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
+    {
+        AddPropertyToStruct(Context, NewFunction, PropertyDescriptor->AsObject());
+    }
+
+    // This function will always be linked as a last element of the list, so it has no next element
+    NewFunction->Next = nullptr;
+
+    // Bind the function and calculate property layout and function locals size
+    NewFunction->Bind();
+    NewFunction->StaticLink(true);
+
+    UE_LOG(LogSuzie, Display, TEXT("Created function %s in outer %s"), *ObjectName, *FunctionOuterObject->GetName());
+    return NewFunction;
+}
+
+void FSuziePluginModule::ParseObjectPath(const FString& ObjectPath, FString& OutOuterObjectPath, FString& OutObjectName)
+{
+    int32 ObjectNameSeparatorIndex;
+    if (ObjectPath.FindLastChar(':', ObjectNameSeparatorIndex))
+    {
+        // There is a sub-object separator in the path name, string past it is the object name
+        OutOuterObjectPath = ObjectPath.Mid(0, ObjectNameSeparatorIndex);
+        OutObjectName = ObjectPath.Mid(ObjectNameSeparatorIndex + 1);
+    }
+    else if (ObjectPath.FindLastChar('.', ObjectNameSeparatorIndex))
+    {
+        // This is a top level object (or this is a legacy path), string past the asset name separator is the object name
+        OutOuterObjectPath = ObjectPath.Mid(0, ObjectNameSeparatorIndex);
+        OutObjectName = ObjectPath.Mid(ObjectNameSeparatorIndex + 1);
+    }
+    else
+    {
+        // This is a top level object (UPackage) name
+        OutOuterObjectPath = TEXT("");
         OutObjectName = ObjectPath;
     }
 }
@@ -460,102 +589,41 @@ void FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContext& Con
     }
 }
 
-void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, const TSharedPtr<FJsonObject>& FunctionJson, EFunctionFlags ExtraFunctionFlags)
+void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, const EFunctionFlags ExtraFunctionFlags)
 {
-    FString PackageName;
-    FString ObjectName;
-    ParseObjectPath(FunctionPath, PackageName, ObjectName);
-
-    // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EFunctionFlags>> FunctionFlagNameLookup = {
-        {TEXT("FUNC_Final"), FUNC_Final},
-        {TEXT("FUNC_BlueprintAuthorityOnly"), FUNC_BlueprintAuthorityOnly},
-        {TEXT("FUNC_BlueprintCosmetic"), FUNC_BlueprintCosmetic},
-        {TEXT("FUNC_Net"), FUNC_Net},
-        {TEXT("FUNC_NetReliable"), FUNC_NetReliable},
-        {TEXT("FUNC_NetRequest"), FUNC_NetRequest},
-        {TEXT("FUNC_Exec"), FUNC_Exec},
-        {TEXT("FUNC_Event"), FUNC_Event},
-        {TEXT("FUNC_NetResponse"), FUNC_NetResponse},
-        {TEXT("FUNC_Static"), FUNC_Static},
-        {TEXT("FUNC_NetMulticast"), FUNC_NetMulticast},
-        {TEXT("FUNC_UbergraphFunction"), FUNC_UbergraphFunction},
-        {TEXT("FUNC_MulticastDelegate"), FUNC_MulticastDelegate},
-        {TEXT("FUNC_Public"), FUNC_Public},
-        {TEXT("FUNC_Private"), FUNC_Private},
-        {TEXT("FUNC_Protected"), FUNC_Protected},
-        {TEXT("FUNC_Delegate"), FUNC_Delegate},
-        {TEXT("FUNC_NetServer"), FUNC_NetServer},
-        {TEXT("FUNC_NetClient"), FUNC_NetClient},
-        {TEXT("FUNC_BlueprintCallable"), FUNC_BlueprintCallable},
-        {TEXT("FUNC_BlueprintEvent"), FUNC_BlueprintEvent},
-        {TEXT("FUNC_BlueprintPure"), FUNC_BlueprintPure},
-        {TEXT("FUNC_EditorOnly"), FUNC_EditorOnly},
-        {TEXT("FUNC_Const"), FUNC_Const},
-        {TEXT("FUNC_NetValidate"), FUNC_NetValidate},
-        {TEXT("FUNC_HasOutParms"), FUNC_HasOutParms},
-        {TEXT("FUNC_HasDefaults"), FUNC_HasDefaults},
-    };
+    if (UFunction* NewFunction = FindOrCreateFunction(Context, FunctionPath))
+    {
+        // Append additional flags to the function
+        NewFunction->FunctionFlags |= ExtraFunctionFlags;
+        
+        // This function will always be linked as a last element of the list, so it has no next element
+        NewFunction->Next = nullptr;
     
-    // Convert struct flag names to the struct flags bitmask
-    const TSet<FString> FunctionFlagNames = ParseFlags(FunctionJson->GetStringField(TEXT("function_flags")));
-    EFunctionFlags FunctionFlags = ExtraFunctionFlags;
-    for (const auto& [FunctionFlagName, FunctionFlagBit] : FunctionFlagNameLookup)
-    {
-        if (FunctionFlagNames.Contains(FunctionFlagName))
+        // Link new function to the end of the linked property list
+        if (Class->Children != nullptr)
         {
-            FunctionFlags |= FunctionFlagBit;
+            UField* CurrentFunction = Class->Children;
+            while (CurrentFunction->Next)
+            {
+                CurrentFunction = CurrentFunction->Next;
+            }
+            CurrentFunction->Next = NewFunction;
         }
-    }
-
-    UFunction* NewFunction = NewObject<UFunction>(Class, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
-    NewFunction->FunctionFlags |= FunctionFlags;
-
-    // Since this function is not marked as Native, we have to initialize Script bytecode for it
-    // Most basic valid kismet bytecode for a function would be EX_Return EX_Nothing EX_EndOfScript, so generate that
-    NewFunction->Script.Append({EX_Return, EX_Nothing, EX_EndOfScript});
-
-    // Create function parameter properties (and function return value property)
-    TArray<TSharedPtr<FJsonValue>> Properties = FunctionJson->GetArrayField(TEXT("properties"));
-    for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
-    {
-        AddPropertyToStruct(Context, NewFunction, PropertyDescriptor->AsObject());
-    }
-
-    // This function will always be linked as a last element of the list, so it has no next element
-    NewFunction->Next = nullptr;
-
-    // Link new function to the end of the linked property list
-    if (Class->Children != nullptr)
-    {
-        UField* CurrentFunction = Class->Children;
-        while (CurrentFunction->Next)
+        else
         {
-            CurrentFunction = CurrentFunction->Next;
+            // This is the first function in the class, assign it as a head of the linked function list
+            Class->Children = NewFunction;
         }
-        CurrentFunction->Next = NewFunction;
-    }
-    else
-    {
-        // This is the first function in the class, assign it as a head of the linked function list
-        Class->Children = NewFunction;
-    }
-    
-    // Add the function to the function lookup for the class
-    Class->AddFunctionToFunctionMap(NewFunction, FName(*ObjectName));
 
-    // Bind the function and calculate property layout and function locals size
-    NewFunction->Bind();
-    NewFunction->StaticLink(true);
+        // Add the function to the function lookup for the class
+        Class->AddFunctionToFunctionMap(NewFunction, NewFunction->GetFName());
 
-    UE_LOG(LogSuzie, Display, TEXT("Added function %s to class %s"), *ObjectName, *Class->GetName());
+        UE_LOG(LogSuzie, Display, TEXT("Added function %s to class %s"), *NewFunction->GetName(), *Class->GetName());
+    }
 }
 
 FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags)
 {
-    const FString PropertyName = PropertyJson->GetStringField(TEXT("name"));
-    const FString PropertyType = PropertyJson->GetStringField(TEXT("type"));
-
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
     static const TArray<TPair<FString, EPropertyFlags>> PropertyFlagNameLookup = {
         {TEXT("CPF_Edit"), CPF_Edit},
@@ -622,113 +690,107 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
             PropertyFlags |= PropertyFlagBit;
         }
     }
-    
-    
-    FProperty* NewProperty = nullptr;
-    
-    if (PropertyType == TEXT("Object"))
+
+    const FString PropertyName = PropertyJson->GetStringField(TEXT("name"));
+    const FString PropertyType = PropertyJson->GetStringField(TEXT("type"));
+
+    FProperty* NewProperty = CastField<FProperty>(FField::Construct(FName(*PropertyType), Owner, FName(*PropertyName), RF_Public));
+    if (NewProperty == nullptr)
     {
-        auto P = new FObjectProperty(Owner, *PropertyName, RF_Public);
-        UClass* InnerClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("class")));
-        check(InnerClass != nullptr);
-        P->PropertyClass = InnerClass;
-        NewProperty = P;
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to create property of type %s: not supported"), *PropertyType);
+        return nullptr;
     }
-    else if (PropertyType == TEXT("SoftObject"))
+    
+    NewProperty->ArrayDim = PropertyJson->GetIntegerField(TEXT("array_dim"));
+    NewProperty->PropertyFlags |= PropertyFlags;
+
+    if (FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(NewProperty))
     {
-        auto P = new FSoftObjectProperty(Owner, *PropertyName, RF_Public);
-        UClass* InnerClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("class")));
-        check(InnerClass != nullptr);
-        P->PropertyClass = InnerClass;
-        NewProperty = P;
-    }
-    else if (PropertyType == TEXT("WeakObject"))
-    {
-        auto P = new FWeakObjectProperty(Owner, *PropertyName, RF_Public);
-        UClass* InnerClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("class")));
-        check(InnerClass != nullptr);
-        P->PropertyClass = InnerClass;
-        NewProperty = P;
-    }
-    else if (PropertyType == TEXT("Struct"))
-    {
-        auto P = new FStructProperty(Owner, *PropertyName, RF_Public);
-        if (UScriptStruct* Struct = FindOrCreateScriptStruct(Context, PropertyJson->GetStringField(TEXT("struct"))))
+        UClass* PropertyClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("class")));
+        ObjectPropertyBase->PropertyClass = PropertyClass;
+        
+        // Class properties additionally define MetaClass value
+        if (FClassProperty* ClassProperty = CastField<FClassProperty>(NewProperty))
         {
-            P->Struct = Struct;
-            NewProperty = P;
+            UClass* MetaClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("meta_class")));
+            ClassProperty->MetaClass = MetaClass;
+        }
+        else if (FSoftClassProperty* SoftClassProperty = CastField<FSoftClassProperty>(NewProperty))
+        {
+            UClass* MetaClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("meta_class")));
+            SoftClassProperty->MetaClass = MetaClass;
         }
     }
-    else if (PropertyType == TEXT("Array"))
+    else if (FStructProperty* StructProperty = CastField<FStructProperty>(NewProperty))
     {
-        auto P = new FArrayProperty(Owner, *PropertyName, RF_Public);
-        if (FProperty* Inner = BuildProperty(Context, P, PropertyJson->GetObjectField(TEXT("inner"))))
+        UScriptStruct* Struct = FindOrCreateScriptStruct(Context, PropertyJson->GetStringField(TEXT("struct")));
+        StructProperty->Struct = Struct;
+    }
+    else if (FEnumProperty* EnumProperty = CastField<FEnumProperty>(NewProperty))
+    {
+        UEnum* Enum = FindOrCreateEnum(Context, PropertyJson->GetStringField(TEXT("enum")));
+        EnumProperty->SetEnum(Enum);
+
+        FProperty* UnderlyingProp = BuildProperty(Context, EnumProperty, PropertyJson->GetObjectField(TEXT("container")));
+        EnumProperty->AddCppProperty(UnderlyingProp);
+    }
+    else if (FByteProperty* ByteProperty = CastField<FByteProperty>(NewProperty))
+    {
+        // Not all byte properties are enumerations so this field might not be set or be null
+        if (PropertyJson->HasTypedField<EJson::String>(TEXT("enum")))
         {
-            P->Inner = Inner;
-            NewProperty = P;
+            UEnum* Enum = FindOrCreateEnum(Context, PropertyJson->GetStringField(TEXT("enum")));
+            ByteProperty->Enum = Enum;
         }
     }
-    else if (PropertyType == TEXT("Set"))
+    else if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(NewProperty))
     {
-        auto P = new FSetProperty(Owner, *PropertyName, RF_Public);
-        if (FProperty* Inner = BuildProperty(Context, P, PropertyJson->GetObjectField(TEXT("key_prop"))))
+        UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        DelegateProperty->SignatureFunction = SignatureFunction;
+    }
+    else if (FMulticastDelegateProperty* MulticastDelegateProperty = CastField<FMulticastDelegateProperty>(NewProperty))
+    {
+        UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        MulticastDelegateProperty->SignatureFunction = SignatureFunction;
+    }
+    else if (FFieldPathProperty* FieldPathProperty = CastField<FFieldPathProperty>(NewProperty))
+    {
+        if (PropertyJson->HasTypedField<EJson::String>(TEXT("property_class")))
         {
-            P->ElementProp = Inner;
-            NewProperty = P;
+            if (FFieldClass* const* PropertyClass = FFieldClass::GetNameToFieldClassMap().Find(TEXT("property_class")))
+            {
+                FieldPathProperty->PropertyClass = *PropertyClass;   
+            }
         }
-    }
-    else if (PropertyType == TEXT("Map"))
-    {
-        auto P = new FMapProperty(Owner, *PropertyName, RF_Public);
-        FProperty* KeyProp = BuildProperty(Context, P, PropertyJson->GetObjectField(TEXT("key_prop")));
-        FProperty* ValueProp = BuildProperty(Context, P, PropertyJson->GetObjectField(TEXT("value_prop")));
-        if (KeyProp && ValueProp)
-        {
-            P->KeyProp = KeyProp;
-            P->ValueProp = ValueProp;
-            NewProperty = P;
-        }
-    }
-    else if (PropertyType == TEXT("Bool"))
-    {
-        NewProperty = new FBoolProperty(Owner, *PropertyName, RF_Public);
-    }
-    else if (PropertyType == TEXT("Float"))
-    {
-        NewProperty = new FFloatProperty(Owner, *PropertyName, RF_Public);
-    }
-    else if (PropertyType == TEXT("Int"))
-    {
-        NewProperty = new FIntProperty(Owner, *PropertyName, RF_Public);
-    }
-    else if (PropertyType == TEXT("UInt32"))
-    {
-        NewProperty = new FUInt32Property(Owner, *PropertyName, RF_Public);
-    }
-    else if (PropertyType == TEXT("Str"))
-    {
-        NewProperty = new FStrProperty(Owner, *PropertyName, RF_Public);
-    }
-    else if (PropertyType == TEXT("Name"))
-    {
-        NewProperty = new FNameProperty(Owner, *PropertyName, RF_Public);
-    }
-    else if (PropertyType == TEXT("Text"))
-    {
-        NewProperty = new FTextProperty(Owner, *PropertyName, RF_Public);
-    }
-    // TODO: Support delegate and multicast delegate properties here
-    // TODO: A whole bunch of properties are missing (double, numerous integral, optional, interface, etc)
-    
-    if (NewProperty)
-    {
-        NewProperty->ArrayDim = PropertyJson->GetIntegerField(TEXT("array_dim"));
-        NewProperty->PropertyFlags |= PropertyFlags;
     }
     else
     {
-        UE_LOG(LogSuzie, Warning, TEXT("Failed to create property of type %s: not supported"), *PropertyType);
+        // TODO: These can be handled together without special casing them by dumping array of FField::GetInnerFields instead of individual fields
+        if (FOptionalProperty* OptionalProperty = CastField<FOptionalProperty>(NewProperty))
+        {
+            FProperty* ValueProperty = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("inner")));
+            OptionalProperty->AddCppProperty(ValueProperty);
+        }
+        else if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(NewProperty))
+        {
+            FProperty* Inner = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("inner")));
+            ArrayProperty->AddCppProperty(Inner);
+        }
+        else if (FSetProperty* SetProperty = CastField<FSetProperty>(NewProperty))
+        {
+            FProperty* KeyProp = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("key_prop")));
+            SetProperty->AddCppProperty(KeyProp);
+        }
+        else if (FMapProperty* MapProperty = CastField<FMapProperty>(NewProperty))
+        {
+            FProperty* KeyProp = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("key_prop")));
+            FProperty* ValueProp = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("value_prop")));
+        
+            MapProperty->AddCppProperty(KeyProp);
+            MapProperty->AddCppProperty(ValueProp);
+        }
     }
+
     return NewProperty;
 }
 
