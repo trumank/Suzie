@@ -9,9 +9,14 @@ DECLARE_LOG_CATEGORY_EXTERN(LogSuzie, Log, All);
 
 struct FDynamicClassGenerationContext
 {
+    // Key is the path of the object
 	TSharedPtr<FJsonObject> GlobalObjectMap;
+    // Value is the class path of the class
     TMap<UClass*, FString> ClassesPendingConstruction;
-    TArray<UClass*> ClassesPendingFinalization;
+    // Value is the object path of the class default object
+    TMap<UClass*, FString> ClassesPendingFinalization;
+    // Value is the property values payload for the object
+    TMap<UObject*, TSharedPtr<FJsonObject>> ObjectsPendingDeserialization;
 };
 
 class FSuziePluginModule : public IModuleInterface
@@ -30,8 +35,13 @@ private:
     UScriptStruct* FindOrCreateScriptStruct(FDynamicClassGenerationContext& Context, const FString& StructPath);
     UEnum* FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath);
     UFunction* FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath);
-    void FinalizeClass(UClass* Class);
 
+    void ProcessDataObjectTree(FDynamicClassGenerationContext& Context, const FString& ObjectPath, UObject* DataObject);
+    UObject* FindOrCreateDataObject(FDynamicClassGenerationContext& Context, const FString& ObjectPath);
+    void DeserializeStructProperties(const UStruct* Struct, void* StructData, const TSharedPtr<FJsonObject>& PropertyValues);
+    void DeserializePropertyValue(const FProperty* Property, void* PropertyValuePtr, const TSharedPtr<FJsonValue>& JsonPropertyValue);
+    void FinalizeClass(FDynamicClassGenerationContext& Context, UClass* Class);
+    
     void ProcessAllJsonClassDefinitions();
 
     static void ParseObjectPath(const FString& ObjectPath, FString& OutOuterObjectPath, FString& OutObjectName);

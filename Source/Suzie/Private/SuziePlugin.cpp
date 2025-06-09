@@ -125,9 +125,11 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         }
 
         // Finalize all classes that we have created now. This includes assembling reference streams, creating default subobjects and populating them with data
-        for (UClass* ClassPendingFinalization : ClassGenerationContext.ClassesPendingFinalization)
+        TArray<UClass*> ClassesPendingFinalization;
+        ClassGenerationContext.ClassesPendingFinalization.GenerateKeyArray(ClassesPendingFinalization);
+        for (UClass* ClassPendingFinalization : ClassesPendingFinalization)
         {
-            FinalizeClass(ClassPendingFinalization);
+            FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
         }
     }
 }
@@ -274,7 +276,7 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     {
         FString ChildPath = FunctionObjectPathValue->AsString();
         const TSharedPtr<FJsonObject> ChildObject = Context.GlobalObjectMap->GetObjectField(ChildPath);
-        if (ChildObject->GetStringField(TEXT("type")) == "Function")
+        if (ChildObject && ChildObject->GetStringField(TEXT("type")) == "Function")
         {
             AddFunctionToClass(Context, NewClass, ChildPath);
         }
@@ -289,8 +291,10 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     NewClass->StaticLink(true);
     NewClass->SetSparseClassDataStruct(NewClass->GetSparseClassDataArchetypeStruct());
 
+    const FString ClassDefaultObjectPath = ClassDefinition->GetStringField(TEXT("class_default_object"));
+    
     // Class default object can be created at this point
-    Context.ClassesPendingFinalization.Add(NewClass);
+    Context.ClassesPendingFinalization.Add(NewClass, ClassDefaultObjectPath);
     
     return NewClass;
 }
@@ -794,14 +798,326 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     return NewProperty;
 }
 
-void FSuziePluginModule::FinalizeClass(UClass* Class)
+UObject* FSuziePluginModule::FindOrCreateDataObject(FDynamicClassGenerationContext& Context, const FString& ObjectPath)
 {
+    // Check if there is already an existing object, in that case we do not need to deserialize and create one
+    if (UObject* ExistingObject = FindObject<UObject>(nullptr, *ObjectPath))
+    {
+        return ExistingObject;
+    }
+
+    // Retrieve the data for the object
+    const TSharedPtr<FJsonObject> ObjectDefinition = Context.GlobalObjectMap->GetObjectField(ObjectPath);
+    checkf(ObjectDefinition.IsValid(), TEXT("Failed to find data object by path %s"), *ObjectPath);
+
+    // We do not attempt to create any "special" objects here, this function can only handle data objects, and all special objects must have already been created at this point
+    // So return early if we encounter an object definition that is a function/class/struct/enum/package
+    const FString ObjectType = ObjectDefinition->GetStringField(TEXT("type"));
+    if (ObjectType != TEXT("Object"))
+    {
+        return nullptr;
+    }
+
+    FString OuterObjectPath;
+    FString ObjectName;
+    ParseObjectPath(ObjectPath, OuterObjectPath, ObjectName);
+
+    // We need a valid outer to be able to create a new data object
+    UObject* ObjectOuter = FindOrCreateDataObject(Context, OuterObjectPath);
+    if (ObjectOuter == nullptr)
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to create data object %s because its outer could not be created"), *ObjectPath);
+        return nullptr;
+    }
+
+    // Find the class of this object
+    const FString ObjectClassPath = ObjectDefinition->GetStringField(TEXT("class"));
+    UClass* ObjectClass = FindObject<UClass>(nullptr, *ObjectClassPath);
+    if (ObjectClass == nullptr)
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to create data object %s because its class %s was not found"), *ObjectPath, *ObjectClassPath);
+        return nullptr;
+    }
+    // If class is pending finalization right now, finalize it before we use its CDO as an archetype
+    if (Context.ClassesPendingFinalization.Contains(ObjectClass))
+    {
+        FinalizeClass(Context, ObjectClass);
+
+        // Class finalization could have caused the creation of this object, so check again to see if it exists now
+        if (UObject* ExistingObject = FindObject<UObject>(nullptr, *ObjectPath))
+        {
+            return ExistingObject;
+        }
+    }
+
+    // Parse object flags. Flags determine how the object should be created
+    static const TArray<TPair<FString, EObjectFlags>> ObjectFlagNameLookup = {
+        {TEXT("RF_Public"), RF_Public},
+        {TEXT("RF_Standalone"), RF_Standalone},
+        {TEXT("RF_Transient"), RF_Transient},
+        {TEXT("RF_Transactional"), RF_Transactional},
+        {TEXT("RF_ArchetypeObject"), RF_ArchetypeObject},
+        {TEXT("RF_ClassDefaultObject"), RF_ClassDefaultObject},
+        {TEXT("RF_DefaultSubObject"), RF_DefaultSubObject},
+    };
+
+    // Convert struct flag names to the struct flags bitmask
+    const TSet<FString> ObjectFlagNames = ParseFlags(ObjectDefinition->GetStringField(TEXT("object_flags")));
+    EObjectFlags ObjectFlags = RF_NoFlags;
+    for (const auto& [ObjectFlagName, ObjectFlagBitmask] : ObjectFlagNameLookup)
+    {
+        if (ObjectFlagNames.Contains(ObjectFlagName))
+        {
+            ObjectFlags |= ObjectFlagBitmask;
+        }
+    }
+
+    // This is a class default object, we do not need to deserialize it under any circumstances, it should already exist and be initialized
+    // We could end up here if one class CDO referenced another class CDO. At that point the CDO we are looking for would not exist yet,
+    // but FinalizeClass call above we did would have created and deserialized it, so at this point it should just be returned
+    if ((ObjectFlags & RF_ClassDefaultObject) != 0)
+    {
+        return ObjectClass->GetDefaultObject();
+    }
+
+    // Retrieve the archetype for this object using the required info
+    // Note that this requires our outer and class chains to be created and initialized
+    // This is not something we need to worry about when deserializing native class hierarchies because compared to assets their
+    // dependency chains are very simple and do not have edges over subobject graphs of different classes
+    UObject* ObjectArchetype = UObject::GetArchetypeFromRequiredInfo(ObjectClass, ObjectOuter, FName(*ObjectName), ObjectFlags);
+
+    // Create the object now
+    UObject* CreatedObject = NewObject<UObject>(ObjectOuter, ObjectClass, FName(*ObjectName), ObjectFlags, ObjectArchetype);
+    if (CreatedObject == nullptr)
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to create a data object %s of class %s"), *ObjectPath, *ObjectClass->GetName());
+        return nullptr;
+    }
+    // Process children of this object and stash data for deserialization
+    ProcessDataObjectTree(Context, ObjectPath, CreatedObject);
+
+    UE_LOG(LogSuzie, Display, TEXT("Created data object %s"), *CreatedObject->GetName());
+    return CreatedObject;
+}
+
+void FSuziePluginModule::ProcessDataObjectTree(FDynamicClassGenerationContext& Context, const FString& ObjectPath, UObject* DataObject)
+{
+    const TSharedPtr<FJsonObject> ObjectDefinition = Context.GlobalObjectMap->GetObjectField(ObjectPath);
+    checkf(ObjectDefinition.IsValid(), TEXT("Failed to find data object by path %s"), *ObjectPath);
+    
+    // Save the data necessary for deserialization of object properties later
+    const TSharedPtr<FJsonObject> PropertyValuesObject = ObjectDefinition->GetObjectField(TEXT("property_values"));
+    checkf(PropertyValuesObject.IsValid(), TEXT("Property values payload not found for data object %s"), *ObjectPath);
+    Context.ObjectsPendingDeserialization.Add(DataObject, PropertyValuesObject);
+
+    // Create subobjects for this object now. We need them to be available before we can deserialize script data for this object
+    const TArray<TSharedPtr<FJsonValue>>& Children = ObjectDefinition->GetArrayField(TEXT("children"));
+    for (const TSharedPtr<FJsonValue>& ChildObjectPathValue : Children)
+    {
+        FString ChildPath = ChildObjectPathValue->AsString();
+        FindOrCreateDataObject(Context, ChildPath);
+    }
+}
+
+void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, void* PropertyValuePtr, const TSharedPtr<FJsonValue>& JsonPropertyValue)
+{
+    if (const FSoftObjectProperty* SoftObjectProperty = CastField<FSoftObjectProperty>(Property))
+    {
+        // We do not actually have to load or look for object pointed by soft object properties, we can just set the value as object path instead
+        const FSoftObjectPtr SoftObjectPtr(FSoftObjectPath(JsonPropertyValue->AsString()));
+        SoftObjectProperty->SetPropertyValue(PropertyValuePtr, SoftObjectPtr);
+    }
+    else if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+    {
+        // For all other object properties, we must already have the object pointed at in memory, we will not load any objects here
+        UObject* Object = StaticFindObject(ObjectProperty->PropertyClass, nullptr, *JsonPropertyValue->AsString());
+        ObjectProperty->SetObjectPropertyValue(PropertyValuePtr, Object);
+    }
+    else if (const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
+    {
+        // Bool properties need special handling because they are represented as JSON booleans
+        BoolProperty->SetPropertyValue(PropertyValuePtr, JsonPropertyValue->AsBool());
+    }
+    else if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property); NumericProperty && !NumericProperty->IsEnum())
+    {
+        if (JsonPropertyValue->Type == EJson::Number)
+        {
+            // If this is a floating point property, just set it to the JSON value
+            if (NumericProperty->IsFloatingPoint())
+            {
+                NumericProperty->SetFloatingPointPropertyValue(PropertyValuePtr, JsonPropertyValue->AsNumber());
+            }
+            else
+            {
+                // This is an integer property otherwise. Whenever its signed or unsigned does not matter here,
+                // because for really large values they will be saved as text and not double
+                NumericProperty->SetIntPropertyValue(PropertyValuePtr, (int64)JsonPropertyValue->AsNumber());
+            }
+        }
+        else
+        {
+            // This is a string representation of the number, let the numeric property parse it
+            NumericProperty->SetNumericPropertyValueFromString(PropertyValuePtr, *JsonPropertyValue->AsString());
+        }
+    }
+    else if (const FNameProperty* NameProperty = CastField<FNameProperty>(Property))
+    {
+        NameProperty->SetPropertyValue(PropertyValuePtr, FName(*JsonPropertyValue->AsString()));
+    }
+    else if (const FStrProperty* StrProperty = CastField<FStrProperty>(Property))
+    {
+        StrProperty->SetPropertyValue(PropertyValuePtr, JsonPropertyValue->AsString());
+    }
+    else if (const FTextProperty* TextProperty = CastField<FTextProperty>(Property))
+    {
+        // TODO: Implement once dump format is known
+        TextProperty->SetPropertyValue(PropertyValuePtr, FText::AsCultureInvariant(JsonPropertyValue->AsString()));
+    }
+    else if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property); EnumProperty && EnumProperty->GetEnum())
+    {
+        const int64 EnumValue = EnumProperty->GetEnum()->GetValueByNameString(JsonPropertyValue->AsString(), EGetByNameFlags::None);
+        EnumProperty->GetUnderlyingProperty()->SetIntPropertyValue(PropertyValuePtr, EnumValue);
+    }
+    else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property); ByteProperty && ByteProperty->Enum)
+    {
+        // Non enum byte properties are handled above as FNumericProperty case
+        const int64 EnumValue = ByteProperty->Enum->GetValueByNameString(JsonPropertyValue->AsString(), EGetByNameFlags::None);
+        ByteProperty->SetIntPropertyValue(PropertyValuePtr, EnumValue);
+    }
+    else if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct)
+    {
+        // Deserialize nested struct properties payload
+        DeserializeStructProperties(StructProperty->Struct, PropertyValuePtr, JsonPropertyValue->AsObject());
+    }
+    else if (const FFieldPathProperty* FieldPathProperty = CastField<FFieldPathProperty>(Property))
+    {
+        const TFieldPath<FProperty> FieldPath(*JsonPropertyValue->AsString());
+        FieldPathProperty->SetPropertyValue(PropertyValuePtr, FieldPath);
+    }
+    else if (const FOptionalProperty* OptionalProperty = CastField<FOptionalProperty>(Property))
+    {
+        // If JSON property value is null, optional property is unset
+        if (JsonPropertyValue->Type == EJson::Null)
+        {
+            OptionalProperty->MarkUnset(PropertyValuePtr);
+        }
+        else
+        {
+            // Deserialize the inner property value otherwise
+            void* ValuePropertyValuePtr = OptionalProperty->MarkSetAndGetInitializedValuePointerToReplace(PropertyValuePtr);
+            DeserializePropertyValue(OptionalProperty->GetValueProperty(), ValuePropertyValuePtr, JsonPropertyValue);
+        }
+    }
+    else if (const FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+    {
+        const TArray<TSharedPtr<FJsonValue>>& ArrayElementJsonValues = JsonPropertyValue->AsArray();
+        FScriptArrayHelper ArrayValueHelper(ArrayProperty, PropertyValuePtr);
+
+        ArrayValueHelper.Resize(ArrayElementJsonValues.Num());
+        for (int32 ElementIndex = 0; ElementIndex < ArrayElementJsonValues.Num(); ElementIndex++)
+        {
+            void* ElementValuePtr = ArrayValueHelper.GetElementPtr(ElementIndex);
+            DeserializePropertyValue(ArrayProperty->Inner, ElementValuePtr, ArrayElementJsonValues[ElementIndex]);
+        }
+    }
+    else if (const FSetProperty* SetProperty = CastField<FSetProperty>(Property))
+    {
+        const TArray<TSharedPtr<FJsonValue>>& SetElementJsonValues = JsonPropertyValue->AsArray();
+        FScriptSetHelper SetValueHelper(SetProperty, PropertyValuePtr);
+        
+        for (const TSharedPtr<FJsonValue>& ElementJsonValue : SetElementJsonValues)
+        {
+            const int32 NewElementIndex = SetValueHelper.AddDefaultValue_Invalid_NeedsRehash();
+            void* ElementValuePtr = SetValueHelper.GetElementPtr(NewElementIndex);
+            DeserializePropertyValue(SetProperty->ElementProp, ElementValuePtr, ElementJsonValue);
+        }
+        SetValueHelper.Rehash();
+    }
+    else if (const FMapProperty* MapProperty = CastField<FMapProperty>(Property))
+    {
+        const TArray<TSharedPtr<FJsonValue>>& MapPairJsonValues = JsonPropertyValue->AsArray();
+        FScriptMapHelper MapValueHelper(MapProperty, PropertyValuePtr);
+        
+        for (const TSharedPtr<FJsonValue>& ElementJsonValue : MapPairJsonValues)
+        {
+            const int32 NewPairIndex = MapValueHelper.AddDefaultValue_Invalid_NeedsRehash();
+            void* KeyElementPtr = MapValueHelper.GetKeyPtr(NewPairIndex);
+            void* ValueElementPtr = MapValueHelper.GetValuePtr(NewPairIndex);
+
+            const TArray<TSharedPtr<FJsonValue>>& PairValue = ElementJsonValue->AsArray();
+            if (PairValue.Num() == 2)
+            {
+                DeserializePropertyValue(MapProperty->KeyProp, KeyElementPtr, PairValue[0]);
+                DeserializePropertyValue(MapProperty->ValueProp, ValueElementPtr, PairValue[1]);
+            }
+        }
+        MapValueHelper.Rehash();
+    }
+}
+
+void FSuziePluginModule::DeserializeStructProperties(const UStruct* Struct, void* StructData, const TSharedPtr<FJsonObject>& PropertyValues)
+{
+    for (TFieldIterator<FProperty> PropertyIterator(Struct, EFieldIterationFlags::IncludeAll); PropertyIterator; ++PropertyIterator)
+    {
+        const FProperty* Property = *PropertyIterator;
+        if (!PropertyValues->HasField(Property->GetName())) continue;
+
+        const TSharedPtr<FJsonValue> PropertyJsonValue = PropertyValues->Values.FindChecked(Property->GetName());
+        if (Property->ArrayDim != 1)
+        {
+            // Handle static array properties here to avoid special handling in DeserializePropertyValue
+            const TArray<TSharedPtr<FJsonValue>>& StaticArrayPropertyJsonValues = PropertyJsonValue->AsArray();
+            for (int32 ArrayIndex = 0; ArrayIndex < FMath::Min(Property->ArrayDim, StaticArrayPropertyJsonValues.Num()); ArrayIndex++)
+            {
+                void* ElementValuePtr = Property->ContainerPtrToValuePtr<void>(StructData, ArrayIndex);
+                const TSharedPtr<FJsonValue> ElementJsonValue = StaticArrayPropertyJsonValues[ArrayIndex];
+                DeserializePropertyValue(Property, ElementValuePtr, ElementJsonValue);
+            }
+        }
+        else
+        {
+            // This is a normal non-static-array property that can be serialized through DeserializePropertyValue
+            void* PropertyValuePtr = Property->ContainerPtrToValuePtr<void>(StructData);
+            DeserializePropertyValue(Property, PropertyValuePtr, PropertyJsonValue);
+        }
+    }
+}
+
+void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, UClass* Class)
+{
+    // Skip this class if it has already been finalized as a dependency of its child class
+    if (!Context.ClassesPendingFinalization.Contains(Class))
+    {
+        return;
+    }
+
+    // Find the definition for the class default object
+    const FString ClassDefaultObjectPath = Context.ClassesPendingFinalization.FindAndRemoveChecked(Class);
+
+    // Finalize our parent class first since we require parent class CDO to be populated before CDO for this class can be created
+    UClass* ParentClass = Class->GetSuperClass();
+    if (ParentClass && Context.ClassesPendingFinalization.Contains(ParentClass))
+    {
+        FinalizeClass(Context, ParentClass);
+    }
+    
     // Assemble reference token stream for garbage collector
     Class->AssembleReferenceTokenStream(true);
 
-    //Make sure default class object is created
-    Class->GetDefaultObject();
-    // TODO: Create class default subobjects, deserialize class default object property defaults
+    // Create default class object for this class. This demands our parent class CDO to be populated with correct defaults
+    UObject* ClassDefaultObject = Class->GetDefaultObject(true);
+    // We only want to process the default subobject tree and track serialization data, the CDO itself has already been created
+    ProcessDataObjectTree(Context, ClassDefaultObjectPath, ClassDefaultObject);
+
+    // Deserialize the data for all the subobjects now that we have a full hierarchy
+    TArray<UObject*> ObjectsPendingDeserialization;
+    Context.ObjectsPendingDeserialization.GenerateKeyArray(ObjectsPendingDeserialization);
+    for (UObject* DataObject : ObjectsPendingDeserialization)
+    {
+        const TSharedPtr<FJsonObject> PropertyValues = Context.ObjectsPendingDeserialization.FindChecked(DataObject);
+        DeserializeStructProperties(DataObject->GetClass(), DataObject, PropertyValues);
+    }
+    Context.ObjectsPendingDeserialization.Empty();
     
     UE_LOG(LogSuzie, Display, TEXT("Finalized class: %s"), *Class->GetName());
 }
