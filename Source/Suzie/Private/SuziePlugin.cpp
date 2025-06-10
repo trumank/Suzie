@@ -315,9 +315,9 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
 
     // Resolve parent struct for this struct before we attempt to create this struct
     UScriptStruct* SuperScriptStruct = nullptr;
-    if (StructDefinition->HasField(TEXT("super_struct")))
+    FString ParentStructPath;
+    if (StructDefinition->TryGetStringField(TEXT("super_struct"), ParentStructPath))
     {
-        const FString ParentStructPath = StructDefinition->GetStringField(TEXT("super_struct"));
         SuperScriptStruct = FindOrCreateScriptStruct(Context, ParentStructPath);
         if (SuperScriptStruct == nullptr)
         {
@@ -689,7 +689,7 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     EPropertyFlags PropertyFlags = ExtraPropertyFlags;
     for (const auto& [PropertyFlagName, PropertyFlagBit] : PropertyFlagNameLookup)
     {
-        if (PropertyFlagName.Contains(PropertyFlagName))
+        if (PropertyFlagNames.Contains(PropertyFlagName))
         {
             PropertyFlags |= PropertyFlagBit;
         }
@@ -710,7 +710,7 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
 
     if (FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(NewProperty))
     {
-        UClass* PropertyClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("class")));
+        UClass* PropertyClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("property_class")));
         ObjectPropertyBase->PropertyClass = PropertyClass;
         
         // Class properties additionally define MetaClass value
@@ -929,9 +929,12 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
     }
     else if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
     {
-        // For all other object properties, we must already have the object pointed at in memory, we will not load any objects here
-        UObject* Object = StaticFindObject(ObjectProperty->PropertyClass, nullptr, *JsonPropertyValue->AsString());
-        ObjectProperty->SetObjectPropertyValue(PropertyValuePtr, Object);
+        if (!JsonPropertyValue->IsNull())
+        {
+            // For all other object properties, we must already have the object pointed at in memory, we will not load any objects here
+            UObject* Object = StaticFindObject(ObjectProperty->PropertyClass, nullptr, *JsonPropertyValue->AsString());
+            ObjectProperty->SetObjectPropertyValue(PropertyValuePtr, Object);
+        }
     }
     else if (const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
     {
