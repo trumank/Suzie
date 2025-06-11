@@ -533,7 +533,9 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         }
     }
 
-    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
+    // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
+    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet | RF_ArchetypeObject);
+    NewFunction->ClearFlags(RF_ArchetypeObject);
     NewFunction->FunctionFlags |= FunctionFlags;
 
     // Since this function is not marked as Native, we have to initialize Script bytecode for it
