@@ -367,6 +367,17 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
         AddPropertyToStruct(Context, NewStruct, PropertyDescriptor->AsObject(), ExtraPropertyFlags);
     }
 
+    // If we have not created any properties and this struct has no parent, we have to create a dummy one since structs cannot have a size of zero
+    if (SuperScriptStruct == nullptr && NewStruct->ChildProperties == nullptr)
+    {
+        // Mark it as transient, non-transactional and deprecated to avoid it being serialized
+        FProperty* NewProperty = CastField<FProperty>(FByteProperty::Construct(NewStruct, TEXT("DummyByteProperty"), RF_Public));
+        NewProperty->PropertyFlags |= CPF_NativeAccessSpecifierPrivate | CPF_Transient | CPF_NonTransactional | CPF_Deprecated;
+
+        NewProperty->Next = nullptr;
+        NewStruct->ChildProperties = NewProperty;
+    }
+    
     // Mark all dynamic script structs as blueprint types
     NewStruct->SetMetaData(FName("BlueprintType"), TEXT("true"));
 
@@ -383,7 +394,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
 
 UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath)
 {
-     // Check if we have already created this enum
+    // Check if we have already created this enum
     if (UEnum* ExistingEnum = FindObject<UEnum>(nullptr, *EnumPath))
     {
         return ExistingEnum;
@@ -444,6 +455,12 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
 
 UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath)
 {
+    // Check if the function already exists
+    if (UFunction* ExistingFunction = FindObject<UFunction>(nullptr, *FunctionPath))
+    {
+        return ExistingFunction;
+    }
+    
     FString ClassPathOrPackageName;
     FString ObjectName;
     ParseObjectPath(FunctionPath, ClassPathOrPackageName, ObjectName);
@@ -460,6 +477,12 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     {
         // This is a package and this function is a top level function (most likely a delegate signature)
         FunctionOuterObject = FindOrCreatePackage(Context, ClassPathOrPackageName);
+    }
+
+    // Check if the function already exists in its parent object
+    if (UFunction* ExistingFunction = FindObjectFast<UFunction>(FunctionOuterObject, *ObjectName))
+    {
+        return ExistingFunction;
     }
 
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
@@ -682,6 +705,8 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         {TEXT("CPF_SkipSerialization"), CPF_SkipSerialization},
         {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
         {TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference},
+        // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
+        {TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash},
     };
 
     // Convert struct flag names to the struct flags bitmask
