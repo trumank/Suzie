@@ -15,8 +15,19 @@ struct FDynamicClassGenerationContext
     TMap<UClass*, FString> ClassesPendingConstruction;
     // Value is the object path of the class default object
     TMap<UClass*, FString> ClassesPendingFinalization;
-    // Value is the property values payload for the object
-    TMap<UObject*, TSharedPtr<FJsonObject>> ObjectsPendingDeserialization;
+};
+
+struct FDynamicObjectConstructionData
+{
+    FName ObjectName;
+    UClass* ObjectClass{};
+    EObjectFlags ObjectFlags{};
+};
+
+struct FDynamicClassConstructionData
+{
+    // Note that this will also contain all subobjects defined in parent classes
+    TArray<FDynamicObjectConstructionData> DefaultSubobjects;
 };
 
 class FSuziePluginModule : public IModuleInterface
@@ -36,9 +47,12 @@ private:
     UEnum* FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath);
     UFunction* FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath);
 
-    void ProcessDataObjectTree(FDynamicClassGenerationContext& Context, const FString& ObjectPath, UObject* DataObject);
-    UObject* FindOrCreateDataObject(FDynamicClassGenerationContext& Context, const FString& ObjectPath);
+    static void PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer);
+    static void PolymorphicClassConstructorPostPropertyInitCallback(UObject* ConstructedObject, const TMap<UObject*, UObject*>& TemplateToSubobjectMap);
+
+    static bool ParseObjectConstructionData(const FDynamicClassGenerationContext& Context, const FString& ObjectPath, FDynamicObjectConstructionData& ObjectConstructionData);
     void DeserializeStructProperties(const UStruct* Struct, void* StructData, const TSharedPtr<FJsonObject>& PropertyValues);
+    static void DeserializeEnumValue(const FNumericProperty* UnderlyingProperty, void* PropertyValuePtr, const UEnum* Enum, const TSharedPtr<FJsonValue>& JsonPropertyValue);
     void DeserializePropertyValue(const FProperty* Property, void* PropertyValuePtr, const TSharedPtr<FJsonValue>& JsonPropertyValue);
     void FinalizeClass(FDynamicClassGenerationContext& Context, UClass* Class);
     

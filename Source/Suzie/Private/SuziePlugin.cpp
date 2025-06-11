@@ -212,9 +212,11 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         CASTCLASS_None,
         UObject::StaticConfigName(),
         RF_Public | RF_Transient | RF_MarkAsRootSet,
-        ParentClass->ClassConstructor,
+        &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper,
         ParentClass->ClassVTableHelperCtorCaller,
         MoveTemp(ClassStaticFunctions));
+    // Remove CLASS_Native flag that was set implicitly by the class constructor
+    ConstructedClassObject->ClassFlags &= (~CLASS_Native);
 
     //Set super structure and ClassWithin (they are required prior to registering)
     ConstructedClassObject->SetSuperStruct(ParentClass);
@@ -825,56 +827,24 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     return NewProperty;
 }
 
-UObject* FSuziePluginModule::FindOrCreateDataObject(FDynamicClassGenerationContext& Context, const FString& ObjectPath)
+bool FSuziePluginModule::ParseObjectConstructionData(const FDynamicClassGenerationContext& Context, const FString& ObjectPath, FDynamicObjectConstructionData& ObjectConstructionData)
 {
-    // Check if there is already an existing object, in that case we do not need to deserialize and create one
-    if (UObject* ExistingObject = FindObject<UObject>(nullptr, *ObjectPath))
-    {
-        return ExistingObject;
-    }
-
     // Retrieve the data for the object
     const TSharedPtr<FJsonObject> ObjectDefinition = Context.GlobalObjectMap->GetObjectField(ObjectPath);
     checkf(ObjectDefinition.IsValid(), TEXT("Failed to find data object by path %s"), *ObjectPath);
 
-    // We do not attempt to create any "special" objects here, this function can only handle data objects, and all special objects must have already been created at this point
-    // So return early if we encounter an object definition that is a function/class/struct/enum/package
-    const FString ObjectType = ObjectDefinition->GetStringField(TEXT("type"));
-    if (ObjectType != TEXT("Object"))
-    {
-        return nullptr;
-    }
-
     FString OuterObjectPath;
     FString ObjectName;
     ParseObjectPath(ObjectPath, OuterObjectPath, ObjectName);
-
-    // We need a valid outer to be able to create a new data object
-    UObject* ObjectOuter = FindOrCreateDataObject(Context, OuterObjectPath);
-    if (ObjectOuter == nullptr)
-    {
-        UE_LOG(LogSuzie, Warning, TEXT("Failed to create data object %s because its outer could not be created"), *ObjectPath);
-        return nullptr;
-    }
+    ObjectConstructionData.ObjectName = FName(*ObjectName);
 
     // Find the class of this object
     const FString ObjectClassPath = ObjectDefinition->GetStringField(TEXT("class"));
-    UClass* ObjectClass = FindObject<UClass>(nullptr, *ObjectClassPath);
-    if (ObjectClass == nullptr)
+    ObjectConstructionData.ObjectClass = FindObject<UClass>(nullptr, *ObjectClassPath);
+    if (ObjectConstructionData.ObjectClass == nullptr)
     {
-        UE_LOG(LogSuzie, Warning, TEXT("Failed to create data object %s because its class %s was not found"), *ObjectPath, *ObjectClassPath);
-        return nullptr;
-    }
-    // If class is pending finalization right now, finalize it before we use its CDO as an archetype
-    if (Context.ClassesPendingFinalization.Contains(ObjectClass))
-    {
-        FinalizeClass(Context, ObjectClass);
-
-        // Class finalization could have caused the creation of this object, so check again to see if it exists now
-        if (UObject* ExistingObject = FindObject<UObject>(nullptr, *ObjectPath))
-        {
-            return ExistingObject;
-        }
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to parse data object %s because its class %s was not found"), *ObjectPath, *ObjectClassPath);
+        return false;
     }
 
     // Parse object flags. Flags determine how the object should be created
@@ -890,59 +860,49 @@ UObject* FSuziePluginModule::FindOrCreateDataObject(FDynamicClassGenerationConte
 
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> ObjectFlagNames = ParseFlags(ObjectDefinition->GetStringField(TEXT("object_flags")));
-    EObjectFlags ObjectFlags = RF_NoFlags;
+    ObjectConstructionData.ObjectFlags = RF_NoFlags;
     for (const auto& [ObjectFlagName, ObjectFlagBitmask] : ObjectFlagNameLookup)
     {
         if (ObjectFlagNames.Contains(ObjectFlagName))
         {
-            ObjectFlags |= ObjectFlagBitmask;
+            ObjectConstructionData.ObjectFlags |= ObjectFlagBitmask;
         }
     }
-
-    // This is a class default object, we do not need to deserialize it under any circumstances, it should already exist and be initialized
-    // We could end up here if one class CDO referenced another class CDO. At that point the CDO we are looking for would not exist yet,
-    // but FinalizeClass call above we did would have created and deserialized it, so at this point it should just be returned
-    if ((ObjectFlags & RF_ClassDefaultObject) != 0)
-    {
-        return ObjectClass->GetDefaultObject();
-    }
-
-    // Retrieve the archetype for this object using the required info
-    // Note that this requires our outer and class chains to be created and initialized
-    // This is not something we need to worry about when deserializing native class hierarchies because compared to assets their
-    // dependency chains are very simple and do not have edges over subobject graphs of different classes
-    UObject* ObjectArchetype = UObject::GetArchetypeFromRequiredInfo(ObjectClass, ObjectOuter, FName(*ObjectName), ObjectFlags);
-
-    // Create the object now
-    UObject* CreatedObject = NewObject<UObject>(ObjectOuter, ObjectClass, FName(*ObjectName), ObjectFlags, ObjectArchetype);
-    if (CreatedObject == nullptr)
-    {
-        UE_LOG(LogSuzie, Warning, TEXT("Failed to create a data object %s of class %s"), *ObjectPath, *ObjectClass->GetName());
-        return nullptr;
-    }
-    // Process children of this object and stash data for deserialization
-    ProcessDataObjectTree(Context, ObjectPath, CreatedObject);
-
-    UE_LOG(LogSuzie, Display, TEXT("Created data object %s"), *CreatedObject->GetName());
-    return CreatedObject;
+    return true;
 }
 
-void FSuziePluginModule::ProcessDataObjectTree(FDynamicClassGenerationContext& Context, const FString& ObjectPath, UObject* DataObject)
+void FSuziePluginModule::DeserializeEnumValue(const FNumericProperty* UnderlyingProperty, void* PropertyValuePtr, const UEnum* Enum, const TSharedPtr<FJsonValue>& JsonPropertyValue)
 {
-    const TSharedPtr<FJsonObject> ObjectDefinition = Context.GlobalObjectMap->GetObjectField(ObjectPath);
-    checkf(ObjectDefinition.IsValid(), TEXT("Failed to find data object by path %s"), *ObjectPath);
-    
-    // Save the data necessary for deserialization of object properties later
-    const TSharedPtr<FJsonObject> PropertyValuesObject = ObjectDefinition->GetObjectField(TEXT("property_values"));
-    checkf(PropertyValuesObject.IsValid(), TEXT("Property values payload not found for data object %s"), *ObjectPath);
-    Context.ObjectsPendingDeserialization.Add(DataObject, PropertyValuesObject);
-
-    // Create subobjects for this object now. We need them to be available before we can deserialize script data for this object
-    const TArray<TSharedPtr<FJsonValue>>& Children = ObjectDefinition->GetArrayField(TEXT("children"));
-    for (const TSharedPtr<FJsonValue>& ChildObjectPathValue : Children)
+    if (JsonPropertyValue->Type == EJson::String)
     {
-        FString ChildPath = ChildObjectPathValue->AsString();
-        FindOrCreateDataObject(Context, ChildPath);
+        // If this is a string value, it is a name of the enum constant that we need to parse to an enum value
+        int32 EnumIndex = Enum->GetIndexByNameString(JsonPropertyValue->AsString(), EGetByNameFlags::None);
+
+        // Validate that the value was actually valid, and if it was not, reset to the first enum constant
+        if (EnumIndex == INDEX_NONE)
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Unknown enum constant name %s for enum %s when parsing value of property %s"),
+                *JsonPropertyValue->AsString(), *Enum->GetPathName(), *UnderlyingProperty->GetPathName());
+            EnumIndex = 0;
+        }
+
+        // Retrieve the enum value for the constant index and set it to the property
+        const int64 EnumValue = Enum->GetValueByIndex(EnumIndex);
+        UnderlyingProperty->SetIntPropertyValue(PropertyValuePtr, EnumValue);
+    }
+    else
+    {
+        // If this is a numeric value, it could be a direct enum value as integer, so set it directly without parsing
+        int64 EnumValue = (int64)JsonPropertyValue->AsNumber();
+
+        // Validate the value as a valid enum constant and fallback to first enum constant if it is not
+        if (!Enum->IsValidEnumValue(EnumValue))
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Invalid enum constant value %lld for enum %s when parsing value of property %s"),
+                EnumValue, *Enum->GetPathName(), *UnderlyingProperty->GetPathName());
+            EnumValue = Enum->GetValueByIndex(0);
+        }
+        UnderlyingProperty->SetIntPropertyValue(PropertyValuePtr, EnumValue);
     }
 }
 
@@ -1005,14 +965,12 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
     }
     else if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property); EnumProperty && EnumProperty->GetEnum())
     {
-        const int64 EnumValue = EnumProperty->GetEnum()->GetValueByNameString(JsonPropertyValue->AsString(), EGetByNameFlags::None);
-        EnumProperty->GetUnderlyingProperty()->SetIntPropertyValue(PropertyValuePtr, EnumValue);
+        DeserializeEnumValue(EnumProperty->GetUnderlyingProperty(), PropertyValuePtr, EnumProperty->GetEnum(), JsonPropertyValue);
     }
     else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property); ByteProperty && ByteProperty->Enum)
     {
         // Non enum byte properties are handled above as FNumericProperty case
-        const int64 EnumValue = ByteProperty->Enum->GetValueByNameString(JsonPropertyValue->AsString(), EGetByNameFlags::None);
-        ByteProperty->SetIntPropertyValue(PropertyValuePtr, EnumValue);
+        DeserializeEnumValue(ByteProperty, PropertyValuePtr, ByteProperty->Enum, JsonPropertyValue);
     }
     else if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct)
     {
@@ -1113,6 +1071,94 @@ void FSuziePluginModule::DeserializeStructProperties(const UStruct* Struct, void
     }
 }
 
+// Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
+// so we do not need an explicit mutex to guard the access to it during class initialization
+static TMap<UClass*, FDynamicClassConstructionData> DynamicClassConstructionData;
+
+void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer)
+{
+    // Find native parent class for this polymorphic class, skipping any generated class parents
+    const UClass* NativeParentClass = ObjectInitializer.GetClass()->GetSuperClass();
+    while (NativeParentClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
+    {
+        NativeParentClass = NativeParentClass->GetSuperClass();
+    }
+
+    // Find the polymorphic class we are currently constructing, in case this is a derived blueprint class
+    const UClass* CurrentClass = ObjectInitializer.GetClass();
+    while (CurrentClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper && !DynamicClassConstructionData.Contains(CurrentClass))
+    {
+        CurrentClass = CurrentClass->GetSuperClass();
+    }
+    // We must have valid construction data for all dynamic classes
+    const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(CurrentClass);
+    checkf(ClassConstructionData, TEXT("Failed to find dynamic class construction data for class %s"), *CurrentClass->GetPathName());
+
+    // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
+    // TODO: This does not handle class overrides of default subobjects nested subobjects. However, these are more than incredibly rare, so this is okay to ignore for now
+    for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
+    {
+        // ReSharper disable once CppExpressionWithoutSideEffects
+        ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
+    }
+    // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
+    NativeParentClass->ClassConstructor(ObjectInitializer);
+
+    // Create missing default subobjects and add them to the template to subobject map
+    TMap<UObject*, UObject*> TemplateToSubobjectMap;
+    for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
+    {
+        // Find an existing subobject or create a new one. Subobjects created previously must have correct classes now due to SetDefaultSubobjectClass we set up above
+        UObject* ExistingOrCreatedSubobject = StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName);
+        if (ExistingOrCreatedSubobject == nullptr)
+        {
+            ExistingOrCreatedSubobject = ObjectInitializer.CreateDefaultSubobject(ObjectInitializer.GetObj(),
+                SubobjectConstructionData.ObjectName, UObject::StaticClass(), SubobjectConstructionData.ObjectClass,
+                true, EnumHasAnyFlags(SubobjectConstructionData.ObjectFlags, RF_Transient));
+        }
+        
+        // Attempt to find a template in the archetype for this default subobject, so we can remap properties that refer to the template to refer to the constructed subobject instead
+        UObject* TemplateObject = StaticFindObjectFast(UObject::StaticClass(), ObjectInitializer.GetArchetype(), SubobjectConstructionData.ObjectName);
+        if (TemplateObject && TemplateObject->HasAnyFlags(RF_DefaultSubObject))
+        {
+            TemplateToSubobjectMap.Add(TemplateObject, ExistingOrCreatedSubobject);
+        }
+    }
+
+    // This is only necessary if we might have to replace template references to instanced subobject references
+    if (!TemplateToSubobjectMap.IsEmpty())
+    {
+        UObject* ConstructedObject = ObjectInitializer.GetObj();
+        ObjectInitializer.Get().AddPropertyPostInitCallback([ConstructedObject, TemplateToSubobjectMap]
+        {
+            PolymorphicClassConstructorPostPropertyInitCallback(ConstructedObject, TemplateToSubobjectMap);
+        });
+    }
+}
+
+void FSuziePluginModule::PolymorphicClassConstructorPostPropertyInitCallback(UObject* ConstructedObject, const TMap<UObject*, UObject*>& TemplateToSubobjectMap)
+{
+    // We want to replace references within the constructed object and its subobjects
+    // TODO: Nested subobjects could theoretically also hold references to instanced subobjects, and instanced subobjects can hold references to the nested subobjects
+    // TODO: We do not have enough context here to perform multi-level instancing, so such references are not currently handled and will point to the template even after construction
+    TArray<UObject*> ObjectsToReplaceReferencesWithin;
+    ObjectsToReplaceReferencesWithin.Add(ConstructedObject);
+    
+
+    // Replace references to templates with references to instanced subobjects for the constructed object graph
+    for (UObject* Object : ObjectsToReplaceReferencesWithin)
+    {
+        for (TFieldIterator<FObjectProperty> PropertyIterator(Object->GetClass(), EFieldIterationFlags::IncludeAll); PropertyIterator; ++PropertyIterator)
+        {
+            const UObject* CurrentObject = PropertyIterator->GetObjectPropertyValue_InContainer(Object);
+            if (UObject* const* ReplacementObjectPtr = TemplateToSubobjectMap.Find(CurrentObject))
+            {
+                PropertyIterator->SetObjectPropertyValue_InContainer(Object, *ReplacementObjectPtr);
+            }
+        }
+    }
+}
+
 void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, UClass* Class)
 {
     // Skip this class if it has already been finalized as a dependency of its child class
@@ -1130,26 +1176,57 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
     {
         FinalizeClass(Context, ParentClass);
     }
+
+    const TSharedPtr<FJsonObject> ClassDefaultObjectDefinition = Context.GlobalObjectMap->GetObjectField(ClassDefaultObjectPath);
+    checkf(ClassDefaultObjectDefinition.IsValid(), TEXT("Failed to find default object by path %s"), *ClassDefaultObjectPath);
+
+    // Iterate child objects of the class default object to find default subobjects that we want to construct before we deserialize the data
+    FDynamicClassConstructionData ClassConstructionData;
+    TArray<TPair<FName, TSharedPtr<FJsonObject>>> ClassDefaultSubobjectNameToObjectDefinition;
+    
+    const TArray<TSharedPtr<FJsonValue>>& Children = ClassDefaultObjectDefinition->GetArrayField(TEXT("children"));
+    for (const TSharedPtr<FJsonValue>& ChildObjectPathValue : Children)
+    {
+        FString ChildPath = ChildObjectPathValue->AsString();
+        FDynamicObjectConstructionData ChildObjectConstructionData;
+        if (ParseObjectConstructionData(Context, ChildPath, ChildObjectConstructionData) && EnumHasAnyFlags(ChildObjectConstructionData.ObjectFlags, RF_DefaultSubObject))
+        {
+            // Class of our default subobject might not have been finalized yet, in which case we have to finalize it now to have its archetype with correct values
+            if (Context.ClassesPendingFinalization.Contains(ChildObjectConstructionData.ObjectClass))
+            {
+                FinalizeClass(Context, ChildObjectConstructionData.ObjectClass);
+            }
+            ClassConstructionData.DefaultSubobjects.Add(ChildObjectConstructionData);
+
+            const TSharedPtr<FJsonObject> ChildSubobjectDefinition = Context.GlobalObjectMap->GetObjectField(ChildPath);
+            ClassDefaultSubobjectNameToObjectDefinition.Add({ChildObjectConstructionData.ObjectName, ChildSubobjectDefinition});
+        }
+    }
+    DynamicClassConstructionData.Add(Class, ClassConstructionData);
     
     // Assemble reference token stream for garbage collector
     Class->AssembleReferenceTokenStream(true);
-
-    // Create default class object for this class. This demands our parent class CDO to be populated with correct defaults
+    // Create class default object now that we have class object construction data
     UObject* ClassDefaultObject = Class->GetDefaultObject(true);
-    // We only want to process the default subobject tree and track serialization data, the CDO itself has already been created
-    ProcessDataObjectTree(Context, ClassDefaultObjectPath, ClassDefaultObject);
 
-    // Deserialize the data for all the subobjects now that we have a full hierarchy
-    TArray<UObject*> ObjectsPendingDeserialization;
-    Context.ObjectsPendingDeserialization.GenerateKeyArray(ObjectsPendingDeserialization);
-    for (UObject* DataObject : ObjectsPendingDeserialization)
+    // Deserialize default object property values
+    if (ClassDefaultObjectDefinition->HasTypedField<EJson::Object>(TEXT("property_values")))
     {
-        const TSharedPtr<FJsonObject> PropertyValues = Context.ObjectsPendingDeserialization.FindChecked(DataObject);
-        DeserializeStructProperties(DataObject->GetClass(), DataObject, PropertyValues);
+        const TSharedPtr<FJsonObject> PropertyValues = ClassDefaultObjectDefinition->GetObjectField(TEXT("property_values"));
+        DeserializeStructProperties(Class, ClassDefaultObject, PropertyValues);
     }
-    Context.ObjectsPendingDeserialization.Empty();
-    
-    UE_LOG(LogSuzie, Display, TEXT("Finalized class: %s"), *Class->GetName());
+
+    // Deserialize subobject property values
+    // TODO: This does not handle non-default values of default subobject nested subobjects. However, this is an incredibly rare case that is okay to ignore for now
+    for (const TPair<FName, TSharedPtr<FJsonObject>>& Pair : ClassDefaultSubobjectNameToObjectDefinition)
+    {
+        UObject* SubobjectTemplate = StaticFindObjectFast(UObject::StaticClass(), ClassDefaultObject, Pair.Key);
+        if (SubobjectTemplate && SubobjectTemplate->HasAnyFlags(RF_DefaultSubObject))
+        {
+            const TSharedPtr<FJsonObject> PropertyValues = Pair.Value->GetObjectField(TEXT("property_values"));
+            DeserializeStructProperties(SubobjectTemplate->GetClass(), SubobjectTemplate, PropertyValues);
+        }
+    }
 }
 
 #undef LOCTEXT_NAMESPACE
