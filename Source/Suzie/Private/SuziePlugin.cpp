@@ -148,22 +148,22 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
         FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
         if (Type == TEXT("Class"))
         {
-            UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
+            UE_LOG(LogSuzie, Verbose, TEXT("Creating class %s"), *ObjectPath);
             FindOrCreateClass(ClassGenerationContext, ObjectPath);
         }
         else if (Type == TEXT("ScriptStruct"))
         {
-            UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
+            UE_LOG(LogSuzie, Verbose, TEXT("Creating struct %s"), *ObjectPath);
             FindOrCreateScriptStruct(ClassGenerationContext, ObjectPath);
         }
         else if (Type == TEXT("Enum"))
         {
-            UE_LOG(LogSuzie, Display, TEXT("Creating enum %s"), *ObjectPath);
+            UE_LOG(LogSuzie, Verbose, TEXT("Creating enum %s"), *ObjectPath);
             FindOrCreateEnum(ClassGenerationContext, ObjectPath);
         }
         else if (Type == TEXT("Function"))
         {
-            UE_LOG(LogSuzie, Display, TEXT("Creating function %s"), *ObjectPath);
+            UE_LOG(LogSuzie, VeryVerbose, TEXT("Creating function %s"), *ObjectPath);
             FindOrCreateFunction(ClassGenerationContext, ObjectPath);
         }
     }
@@ -286,7 +286,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
 
     Context.ClassesPendingConstruction.Add(ConstructedClassObject, ClassPath);
     
-    UE_LOG(LogSuzie, Display, TEXT("Created dynamic class: %s"), *ClassName);
+    UE_LOG(LogSuzie, Verbose, TEXT("Created dynamic class: %s"), *ClassName);
     return ConstructedClassObject;
 }
 
@@ -447,7 +447,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     NewStruct->PrepareCppStructOps();
     NewStruct->StaticLink(true);
     
-    UE_LOG(LogSuzie, Display, TEXT("Created struct: %s"), *ObjectName);
+    UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
 
     // Struct properties using this struct can be created at this point
     return NewStruct;
@@ -509,7 +509,7 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     // Mark all dynamic enums as blueprint types
     NewEnum->SetMetaData(*FBlueprintMetadata::MD_AllowableBlueprintVariableType.ToString(), TEXT("true"));
     
-    UE_LOG(LogSuzie, Display, TEXT("Created enum: %s"), *ObjectName);
+    UE_LOG(LogSuzie, Verbose, TEXT("Created enum: %s"), *ObjectName);
 
     return NewEnum;
 }
@@ -636,7 +636,7 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         }
     }
 
-    UE_LOG(LogSuzie, Display, TEXT("Created function %s in outer %s"), *ObjectName, *FunctionOuterObject->GetName());
+    UE_LOG(LogSuzie, VeryVerbose, TEXT("Created function %s in outer %s"), *ObjectName, *FunctionOuterObject->GetName());
     return NewFunction;
 }
 
@@ -694,7 +694,7 @@ void FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContext& Con
             // This is the first property in the struct, assign it as a head of the linked property list
             Struct->ChildProperties = NewProperty;
         }
-        UE_LOG(LogSuzie, Display, TEXT("Added property %s to struct %s"), *NewProperty->GetName(), *Struct->GetName());
+        UE_LOG(LogSuzie, VeryVerbose, TEXT("Added property %s to struct %s"), *NewProperty->GetName(), *Struct->GetName());
     }
 }
 
@@ -727,7 +727,7 @@ void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Cont
         // Add the function to the function lookup for the class
         Class->AddFunctionToFunctionMap(NewFunction, NewFunction->GetFName());
 
-        UE_LOG(LogSuzie, Display, TEXT("Added function %s to class %s"), *NewFunction->GetName(), *Class->GetName());
+        UE_LOG(LogSuzie, VeryVerbose, TEXT("Added function %s to class %s"), *NewFunction->GetName(), *Class->GetName());
     }
 }
 
