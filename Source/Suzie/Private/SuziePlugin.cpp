@@ -1,5 +1,4 @@
 #include "SuziePlugin.h"
-
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -15,6 +14,7 @@
 #include "Framework/Commands/UICommandList.h"
 #include "Engine/EngineTypes.h"
 #include "PropertyEditorModule.h"
+#include "SuzieDecompressionHelper.h"
 #include "UObject/PropertyOptional.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "UObject/UObjectAllocator.h"
@@ -37,9 +37,6 @@ void FSuziePluginModule::ShutdownModule()
 
 void FSuziePluginModule::ProcessAllJsonClassDefinitions()
 {
-    // This can potentially take some time so show a progress task
-    FScopedSlowTask GenerateDynamicClassesTask(1.0f, LOCTEXT("GeneratingDynamicClasses", "Suzie: Generating Dynamic Classes"));
-    GenerateDynamicClassesTask.Visibility = ESlowTaskVisibility::Important;
     
     // Define where we expect JSON class definitions to be
     const FString JsonClassesPath = FPaths::ProjectContentDir() / TEXT("DynamicClasses");
@@ -51,22 +48,33 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         return;
     }
     
-    // Find all JSON files
-    TArray<FString> JsonFiles;
-    FPlatformFileManager::Get().GetPlatformFile().FindFiles(JsonFiles, *JsonClassesPath, TEXT("json"));
+    // Find all JSON files and compressed JSON files
+    TArray<FString> JsonFileNames;
+    IFileManager::Get().FindFiles(JsonFileNames, *JsonClassesPath, TEXT("*.json"));
+
+    TArray<FString> CompressedJsonFileNames;
+    IFileManager::Get().FindFiles(CompressedJsonFileNames, *JsonClassesPath, TEXT("*.json.gz"));
     
-    UE_LOG(LogSuzie, Display, TEXT("Found %d JSON class definition files"), JsonFiles.Num());
+    UE_LOG(LogSuzie, Display, TEXT("Found %d JSON class definition files"), JsonFileNames.Num() + CompressedJsonFileNames.Num());
+
+    // This can potentially take some time so show a progress task
+    const int32 TotalAmountOfWork = JsonFileNames.Num() + CompressedJsonFileNames.Num();
+    FScopedSlowTask GenerateDynamicClassesTask(TotalAmountOfWork, LOCTEXT("GeneratingDynamicClasses", "Suzie: Generating Dynamic Classes"));
+    GenerateDynamicClassesTask.Visibility = ESlowTaskVisibility::Important;
+    GenerateDynamicClassesTask.ForceRefresh();
     
     // Process each JSON file
-    for (const FString& JsonFilePath : JsonFiles)
+    for (const FString& JsonFileName : JsonFileNames)
     {
-        UE_LOG(LogSuzie, Display, TEXT("Processing JSON class definition: %s"), *JsonFilePath);
+        GenerateDynamicClassesTask.EnterProgressFrame(1, FText::Format(LOCTEXT("ProcessingJsonFile", "Generating classes for file {0}"), FText::AsCultureInvariant(JsonFileName)));
+        GenerateDynamicClassesTask.ForceRefresh();
+        UE_LOG(LogSuzie, Display, TEXT("Processing JSON class definition: %s"), *JsonFileName);
     
         // Read the JSON file
         FString JsonContent;
-        if (!FFileHelper::LoadFileToString(JsonContent, *JsonFilePath))
+        if (!FFileHelper::LoadFileToString(JsonContent, *(JsonClassesPath / JsonFileName)))
         {
-            UE_LOG(LogSuzie, Error, TEXT("Failed to read JSON file: %s"), *JsonFilePath);
+            UE_LOG(LogSuzie, Error, TEXT("Failed to read JSON file: %s"), *JsonFileName);
             return;
         }
     
@@ -75,66 +83,108 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonContent);
         if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
         {
-            UE_LOG(LogSuzie, Error, TEXT("Failed to parse JSON in file: %s"), *JsonFilePath);
+            UE_LOG(LogSuzie, Error, TEXT("Failed to parse JSON in file: %s"), *JsonFileName);
             continue;
         }
+        CreateDynamicClassesForJsonObject(JsonObject);
+    }
+    
+    // Process each compressed JSON file
+    for (const FString& CompressedJsonFileName : CompressedJsonFileNames)
+    {
+        GenerateDynamicClassesTask.EnterProgressFrame(1, FText::Format(LOCTEXT("ProcessingJsonFile", "Generating classes for file {0}"), FText::AsCultureInvariant(CompressedJsonFileName)));
+        GenerateDynamicClassesTask.ForceRefresh();
+        UE_LOG(LogSuzie, Display, TEXT("Processing compressed JSON class definition: %s"), *CompressedJsonFileName);
 
-        const TSharedPtr<FJsonObject>* Objects;
-        if (!JsonObject->TryGetObjectField(TEXT("objects"), Objects))
+        // Read binary file contents
+        TArray<uint8> CompressedFileContents;
+        if (!FFileHelper::LoadFileToArray(CompressedFileContents, *(JsonClassesPath / CompressedJsonFileName)))
         {
-            UE_LOG(LogSuzie, Error, TEXT("Missing 'objects' map"));
+            UE_LOG(LogSuzie, Error, TEXT("Failed to read compressed JSON file: %s"), *CompressedJsonFileName);
+            return;
+        }
+
+        // Attempt to decompress the file as Gzip archive
+        TArray<uint8> DecompressedFileContents;
+        if (!FSuzieDecompressionHelper::DecompressMemoryGzip(CompressedFileContents, DecompressedFileContents))
+        {
+            UE_LOG(LogSuzie, Error, TEXT("Failed to decompress compressed JSON file as valid GZIP: %s"), *CompressedJsonFileName);
+            return;
+        }
+
+        // Parse the binary stream into the string. UE will attempt to guess the encoding for us
+        FString JsonContent;
+        FFileHelper::BufferToString(JsonContent, DecompressedFileContents.GetData(), DecompressedFileContents.Num());
+        
+        // Parse the JSON
+        TSharedPtr<FJsonObject> JsonObject;
+        TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonContent);
+        if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
+        {
+            UE_LOG(LogSuzie, Error, TEXT("Failed to parse compressed JSON in file: %s"), *CompressedJsonFileName);
             continue;
         }
+        CreateDynamicClassesForJsonObject(JsonObject);
+    }
+}
 
-        // Create class generation context
-        FDynamicClassGenerationContext ClassGenerationContext;
-        ClassGenerationContext.GlobalObjectMap = *Objects;
+void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJsonObject>& RootObject)
+{
+    const TSharedPtr<FJsonObject>* Objects;
+    if (!RootObject->TryGetObjectField(TEXT("objects"), Objects))
+    {
+        UE_LOG(LogSuzie, Error, TEXT("Missing 'objects' map"));
+        return;
+    }
 
-        // Create classes, script structs and global delegate functions
-        for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
+    // Create class generation context
+    FDynamicClassGenerationContext ClassGenerationContext;
+    ClassGenerationContext.GlobalObjectMap = *Objects;
+
+    // Create classes, script structs and global delegate functions
+    for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
+    {
+        FString ObjectPath = It.Key();
+        FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
+        if (Type == TEXT("Class"))
         {
-            FString ObjectPath = It.Key();
-            FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
-            if (Type == TEXT("Class"))
-            {
-                UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
-                FindOrCreateClass(ClassGenerationContext, ObjectPath);
-            }
-            else if (Type == TEXT("ScriptStruct"))
-            {
-                UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
-                FindOrCreateScriptStruct(ClassGenerationContext, ObjectPath);
-            }
-            else if (Type == TEXT("Enum"))
-            {
-                UE_LOG(LogSuzie, Display, TEXT("Creating enum %s"), *ObjectPath);
-                FindOrCreateEnum(ClassGenerationContext, ObjectPath);
-            }
-            else if (Type == TEXT("Function"))
-            {
-                UE_LOG(LogSuzie, Display, TEXT("Creating function %s"), *ObjectPath);
-                FindOrCreateFunction(ClassGenerationContext, ObjectPath);
-            }
+            UE_LOG(LogSuzie, Display, TEXT("Creating class %s"), *ObjectPath);
+            FindOrCreateClass(ClassGenerationContext, ObjectPath);
         }
-
-        // Construct classes that have been created but have not been constructed yet due to nobody referencing them
-        while (!ClassGenerationContext.ClassesPendingConstruction.IsEmpty())
+        else if (Type == TEXT("ScriptStruct"))
         {
-            TArray<FString> ClassPathsPendingConstruction;
-            ClassGenerationContext.ClassesPendingConstruction.GenerateValueArray(ClassPathsPendingConstruction);
-            for (const FString& ClassPath : ClassPathsPendingConstruction)
-            {
-                FindOrCreateClass(ClassGenerationContext, ClassPath);
-            }
+            UE_LOG(LogSuzie, Display, TEXT("Creating struct %s"), *ObjectPath);
+            FindOrCreateScriptStruct(ClassGenerationContext, ObjectPath);
         }
-
-        // Finalize all classes that we have created now. This includes assembling reference streams, creating default subobjects and populating them with data
-        TArray<UClass*> ClassesPendingFinalization;
-        ClassGenerationContext.ClassesPendingFinalization.GenerateKeyArray(ClassesPendingFinalization);
-        for (UClass* ClassPendingFinalization : ClassesPendingFinalization)
+        else if (Type == TEXT("Enum"))
         {
-            FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
+            UE_LOG(LogSuzie, Display, TEXT("Creating enum %s"), *ObjectPath);
+            FindOrCreateEnum(ClassGenerationContext, ObjectPath);
         }
+        else if (Type == TEXT("Function"))
+        {
+            UE_LOG(LogSuzie, Display, TEXT("Creating function %s"), *ObjectPath);
+            FindOrCreateFunction(ClassGenerationContext, ObjectPath);
+        }
+    }
+
+    // Construct classes that have been created but have not been constructed yet due to nobody referencing them
+    while (!ClassGenerationContext.ClassesPendingConstruction.IsEmpty())
+    {
+        TArray<FString> ClassPathsPendingConstruction;
+        ClassGenerationContext.ClassesPendingConstruction.GenerateValueArray(ClassPathsPendingConstruction);
+        for (const FString& ClassPath : ClassPathsPendingConstruction)
+        {
+            FindOrCreateClass(ClassGenerationContext, ClassPath);
+        }
+    }
+
+    // Finalize all classes that we have created now. This includes assembling reference streams, creating default subobjects and populating them with data
+    TArray<UClass*> ClassesPendingFinalization;
+    ClassGenerationContext.ClassesPendingFinalization.GenerateKeyArray(ClassesPendingFinalization);
+    for (UClass* ClassPendingFinalization : ClassesPendingFinalization)
+    {
+        FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
     }
 }
 
@@ -561,6 +611,25 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     // Bind the function and calculate property layout and function locals size
     NewFunction->Bind();
     NewFunction->StaticLink(true);
+
+    // Do some tagging of the function for convenience based on parameter types and names
+    for (TFieldIterator<FProperty> PropertyIterator(NewFunction); PropertyIterator; ++PropertyIterator)
+    {
+        const FProperty* Property = *PropertyIterator;
+        if (!Property->HasAllPropertyFlags(CPF_Parm) || Property->HasAnyPropertyFlags(CPF_ReturnParm)) continue;
+
+        // Object properties called WorldContext/WorldContextObject are automatically tagged as world context for convenience
+        if (Property->IsA<FObjectProperty>() && (Property->GetFName() == TEXT("WorldContext") || Property->GetFName() == TEXT("WorldContextObject")))
+        {
+            NewFunction->SetMetaData(TEXT("WorldContext"), *Property->GetName());
+        }
+        // Latent Info struct parameter properties should always be tagged as LatentInfo and indicate async BP functions
+        if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct == FLatentActionInfo::StaticStruct())
+        {
+            NewFunction->SetMetaData(TEXT("LatentInfo"), *Property->GetName());
+            NewFunction->SetMetaData(TEXT("Latent"), TEXT(""));
+        }
+    }
 
     UE_LOG(LogSuzie, Display, TEXT("Created function %s in outer %s"), *ObjectName, *FunctionOuterObject->GetName());
     return NewFunction;

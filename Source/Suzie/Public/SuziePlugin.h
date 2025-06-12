@@ -78,7 +78,8 @@ private:
     void CollectNestedDefaultSubobjectTypeOverrides(FDynamicClassGenerationContext& Context, TArray<FName> SubobjectNameStack, const FString& SubobjectPath, TArray<FNestedDefaultSubobjectOverrideData>& OutSubobjectOverrideData);
     void DeserializeObjectAndSubobjectPropertyValuesRecursive(const FDynamicClassGenerationContext& Context, UObject* Object, const TSharedPtr<FJsonObject>& ObjectDefinition);
     void FinalizeClass(FDynamicClassGenerationContext& Context, UClass* Class);
-    
+
+    void CreateDynamicClassesForJsonObject(const TSharedPtr<FJsonObject>& RootObject);
     void ProcessAllJsonClassDefinitions();
 
     static void ParseObjectPath(const FString& ObjectPath, FString& OutOuterObjectPath, FString& OutObjectName);
