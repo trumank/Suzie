@@ -24,10 +24,30 @@ struct FDynamicObjectConstructionData
     EObjectFlags ObjectFlags{};
 };
 
+struct FNestedDefaultSubobjectOverrideData
+{
+    TArray<FName> SubobjectPath;
+    UClass* OverridenClass{};
+};
+
 struct FDynamicClassConstructionData
 {
+    // Names of default subobjects that our native parent class defines but that we do not want to be created
+    TArray<FName> SuppressedDefaultSubobjects;
     // Note that this will also contain all subobjects defined in parent classes
     TArray<FDynamicObjectConstructionData> DefaultSubobjects;
+    // Overrides for nested default subobjects. Note that top level subobjects will not be included here
+    TArray<FNestedDefaultSubobjectOverrideData> DefaultSubobjectOverrides;
+    // Archetype to use for constructing the object when no archetype has been provided or the provided archetype was a CDO
+    UObject* DefaultObjectArchetype{};
+};
+
+struct FDynamicClassConstructionIntermediates
+{
+    UObject* ConstructedObject{};
+    const FDynamicClassConstructionData* ConstructionData{};
+    UObject* ArchetypeObject{};
+    TMap<UObject*, UObject*> TemplateToSubobjectMap;
 };
 
 class FSuziePluginModule : public IModuleInterface
@@ -47,13 +67,16 @@ private:
     UEnum* FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath);
     UFunction* FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath);
 
+    static UClass* GetNativeParentClassForDynamicClass(const UClass* InDynamicClass);
+    static UClass* GetDynamicParentClassForBlueprintClass(UClass* InBlueprintClass);
     static void PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer);
-    static void PolymorphicClassConstructorPostPropertyInitCallback(UObject* ConstructedObject, const TMap<UObject*, UObject*>& TemplateToSubobjectMap);
 
     static bool ParseObjectConstructionData(const FDynamicClassGenerationContext& Context, const FString& ObjectPath, FDynamicObjectConstructionData& ObjectConstructionData);
     void DeserializeStructProperties(const UStruct* Struct, void* StructData, const TSharedPtr<FJsonObject>& PropertyValues);
     static void DeserializeEnumValue(const FNumericProperty* UnderlyingProperty, void* PropertyValuePtr, const UEnum* Enum, const TSharedPtr<FJsonValue>& JsonPropertyValue);
     void DeserializePropertyValue(const FProperty* Property, void* PropertyValuePtr, const TSharedPtr<FJsonValue>& JsonPropertyValue);
+    void CollectNestedDefaultSubobjectTypeOverrides(FDynamicClassGenerationContext& Context, TArray<FName> SubobjectNameStack, const FString& SubobjectPath, TArray<FNestedDefaultSubobjectOverrideData>& OutSubobjectOverrideData);
+    void DeserializeObjectAndSubobjectPropertyValuesRecursive(const FDynamicClassGenerationContext& Context, UObject* Object, const TSharedPtr<FJsonObject>& ObjectDefinition);
     void FinalizeClass(FDynamicClassGenerationContext& Context, UClass* Class);
     
     void ProcessAllJsonClassDefinitions();

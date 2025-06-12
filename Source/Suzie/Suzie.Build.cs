@@ -4,6 +4,7 @@ public class Suzie : ModuleRules
 	public Suzie(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+		OptimizeCode = CodeOptimization.Never;
 
 		PublicIncludePaths.AddRange(new string[] {}); 
 		

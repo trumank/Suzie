@@ -37,6 +37,10 @@ void FSuziePluginModule::ShutdownModule()
 
 void FSuziePluginModule::ProcessAllJsonClassDefinitions()
 {
+    // This can potentially take some time so show a progress task
+    FScopedSlowTask GenerateDynamicClassesTask(1.0f, LOCTEXT("GeneratingDynamicClasses", "Suzie: Generating Dynamic Classes"));
+    GenerateDynamicClassesTask.Visibility = ESlowTaskVisibility::Important;
+    
     // Define where we expect JSON class definitions to be
     const FString JsonClassesPath = FPaths::ProjectContentDir() / TEXT("DynamicClasses");
     
@@ -1071,89 +1075,161 @@ void FSuziePluginModule::DeserializeStructProperties(const UStruct* Struct, void
     }
 }
 
+UClass* FSuziePluginModule::GetNativeParentClassForDynamicClass(const UClass* InDynamicClass)
+{
+    // Find native parent class for this polymorphic class, skipping any generated class parents
+    UClass* NativeParentClass = InDynamicClass ? InDynamicClass->GetSuperClass() : nullptr;
+    while (NativeParentClass && NativeParentClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
+    {
+        NativeParentClass = NativeParentClass->GetSuperClass();
+    }
+    return NativeParentClass;
+}
+
 // Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
 // so we do not need an explicit mutex to guard the access to it during class initialization
 static TMap<UClass*, FDynamicClassConstructionData> DynamicClassConstructionData;
 
-void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer)
+UClass* FSuziePluginModule::GetDynamicParentClassForBlueprintClass(UClass* InBlueprintClass)
 {
-    // Find native parent class for this polymorphic class, skipping any generated class parents
-    const UClass* NativeParentClass = ObjectInitializer.GetClass()->GetSuperClass();
-    while (NativeParentClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
-    {
-        NativeParentClass = NativeParentClass->GetSuperClass();
-    }
-
     // Find the polymorphic class we are currently constructing, in case this is a derived blueprint class
-    const UClass* CurrentClass = ObjectInitializer.GetClass();
+    UClass* CurrentClass = InBlueprintClass;
     while (CurrentClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper && !DynamicClassConstructionData.Contains(CurrentClass))
     {
         CurrentClass = CurrentClass->GetSuperClass();
     }
+    return CurrentClass;
+}
+
+// Mirrors layout of first 3 members of FObjectInitializer
+struct FObjectInitializerAccessStub
+{
+    UObject* Obj;
+    UObject* ObjectArchetype;
+    bool bCopyTransientsFromClassDefaults;
+};
+
+void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer)
+{
+    const UClass* NativeParentClass = GetNativeParentClassForDynamicClass(ObjectInitializer.GetClass());
+    const UClass* CurrentClass = GetDynamicParentClassForBlueprintClass(ObjectInitializer.GetClass());
+    
     // We must have valid construction data for all dynamic classes
     const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(CurrentClass);
     checkf(ClassConstructionData, TEXT("Failed to find dynamic class construction data for class %s"), *CurrentClass->GetPathName());
 
+    // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
+    // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
+    // This has to be done before we call the parent constructor and create any default subobjects
+    if ((ObjectInitializer.GetArchetype() == nullptr || ObjectInitializer.GetArchetype() == ObjectInitializer.GetClass()->ClassDefaultObject) && ClassConstructionData->DefaultObjectArchetype)
+    {
+        FObjectInitializerAccessStub* ObjectInitializerAccess = reinterpret_cast<FObjectInitializerAccessStub*>(&ObjectInitializer.Get());
+        ObjectInitializerAccess->ObjectArchetype = ClassConstructionData->DefaultObjectArchetype;
+        ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
+    }
+    
     // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
-    // TODO: This does not handle class overrides of default subobjects nested subobjects. However, these are more than incredibly rare, so this is okay to ignore for now
     for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
     {
         // ReSharper disable once CppExpressionWithoutSideEffects
         ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
     }
+    // Disable creation of certain subobjects that this class does not want to have
+    for (const FName& DisabledSubobjectName : ClassConstructionData->SuppressedDefaultSubobjects)
+    {
+        // ReSharper disable once CppExpressionWithoutSideEffects
+        ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
+    }
+    
+    // Also apply overrides for nested subobject types. These are very rare but should be handled regardless
+    // TODO: We do not handle disabled nested default subobjects currently. Case is extremely rare and nested subobjects are extremely rare themselves, so this can be revised later
+    for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : ClassConstructionData->DefaultSubobjectOverrides)
+    {
+        // ReSharper disable once CppExpressionWithoutSideEffects
+        ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
+    }
+    
     // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
     NativeParentClass->ClassConstructor(ObjectInitializer);
 
     // Create missing default subobjects and add them to the template to subobject map
-    TMap<UObject*, UObject*> TemplateToSubobjectMap;
     for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
     {
-        // Find an existing subobject or create a new one. Subobjects created previously must have correct classes now due to SetDefaultSubobjectClass we set up above
-        UObject* ExistingOrCreatedSubobject = StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName);
-        if (ExistingOrCreatedSubobject == nullptr)
+        if (StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
         {
-            ExistingOrCreatedSubobject = ObjectInitializer.CreateDefaultSubobject(ObjectInitializer.GetObj(),
+            ObjectInitializer.CreateDefaultSubobject(ObjectInitializer.GetObj(),
                 SubobjectConstructionData.ObjectName, UObject::StaticClass(), SubobjectConstructionData.ObjectClass,
                 true, EnumHasAnyFlags(SubobjectConstructionData.ObjectFlags, RF_Transient));
         }
-        
-        // Attempt to find a template in the archetype for this default subobject, so we can remap properties that refer to the template to refer to the constructed subobject instead
-        UObject* TemplateObject = StaticFindObjectFast(UObject::StaticClass(), ObjectInitializer.GetArchetype(), SubobjectConstructionData.ObjectName);
-        if (TemplateObject && TemplateObject->HasAnyFlags(RF_DefaultSubObject))
-        {
-            TemplateToSubobjectMap.Add(TemplateObject, ExistingOrCreatedSubobject);
-        }
-    }
-
-    // This is only necessary if we might have to replace template references to instanced subobject references
-    if (!TemplateToSubobjectMap.IsEmpty())
-    {
-        UObject* ConstructedObject = ObjectInitializer.GetObj();
-        ObjectInitializer.Get().AddPropertyPostInitCallback([ConstructedObject, TemplateToSubobjectMap]
-        {
-            PolymorphicClassConstructorPostPropertyInitCallback(ConstructedObject, TemplateToSubobjectMap);
-        });
     }
 }
 
-void FSuziePluginModule::PolymorphicClassConstructorPostPropertyInitCallback(UObject* ConstructedObject, const TMap<UObject*, UObject*>& TemplateToSubobjectMap)
+void FSuziePluginModule::CollectNestedDefaultSubobjectTypeOverrides(FDynamicClassGenerationContext& Context, TArray<FName> SubobjectNameStack, const FString& SubobjectPath, TArray<FNestedDefaultSubobjectOverrideData>& OutSubobjectOverrideData)
 {
-    // We want to replace references within the constructed object and its subobjects
-    // TODO: Nested subobjects could theoretically also hold references to instanced subobjects, and instanced subobjects can hold references to the nested subobjects
-    // TODO: We do not have enough context here to perform multi-level instancing, so such references are not currently handled and will point to the template even after construction
-    TArray<UObject*> ObjectsToReplaceReferencesWithin;
-    TemplateToSubobjectMap.GenerateValueArray(ObjectsToReplaceReferencesWithin);
-    ObjectsToReplaceReferencesWithin.Add(ConstructedObject);
-
-    // Replace references to templates with references to instanced subobjects for the constructed object graph
-    for (UObject* Object : ObjectsToReplaceReferencesWithin)
+    const TSharedPtr<FJsonObject> ObjectDefinition = Context.GlobalObjectMap->GetObjectField(SubobjectPath);
+    checkf(ObjectDefinition.IsValid(), TEXT("Failed to find subobject object by path %s"), *SubobjectPath);
+    
+    // Parse construction data for this object first. Skip if this is not a subobject
+    FDynamicObjectConstructionData ObjectConstructionData;
+    if (!ParseObjectConstructionData(Context, SubobjectPath, ObjectConstructionData) || !EnumHasAnyFlags(ObjectConstructionData.ObjectFlags, RF_DefaultSubObject))
     {
-        for (TFieldIterator<FObjectProperty> PropertyIterator(Object->GetClass(), EFieldIterationFlags::IncludeAll); PropertyIterator; ++PropertyIterator)
+        return;
+    }
+    // Class of the overriden default subobject might not have been finalized yet, in which case we have to finalize it now to have its archetype with correct values
+    if (Context.ClassesPendingFinalization.Contains(ObjectConstructionData.ObjectClass))
+    {
+        FinalizeClass(Context, ObjectConstructionData.ObjectClass);
+    }
+
+    // Add the name of this object to the stack. If this is not a top level subobject, add it to the override list
+    SubobjectNameStack.Add(ObjectConstructionData.ObjectName);
+    if (SubobjectNameStack.Num() > 1)
+    {
+        OutSubobjectOverrideData.Add({SubobjectNameStack, ObjectConstructionData.ObjectClass});
+    }
+
+    // Iterate over children and collect nested default subobject overrides for them
+    if (ObjectDefinition->HasTypedField<EJson::Array>(TEXT("children")))
+    {
+        const TArray<TSharedPtr<FJsonValue>>& Children = ObjectDefinition->GetArrayField(TEXT("children"));
+        for (const TSharedPtr<FJsonValue>& ChildJsonValue : Children)
         {
-            const UObject* CurrentObject = PropertyIterator->GetObjectPropertyValue_InContainer(Object);
-            if (UObject* const* ReplacementObjectPtr = TemplateToSubobjectMap.Find(CurrentObject))
+            // CollectNestedDefaultSubobjectTypeOverrides will discard children that are not actually subobjects
+            const FString ChildPath = ChildJsonValue->AsString();
+            CollectNestedDefaultSubobjectTypeOverrides(Context, SubobjectNameStack, ChildPath, OutSubobjectOverrideData);
+        }
+    }
+}
+
+void FSuziePluginModule::DeserializeObjectAndSubobjectPropertyValuesRecursive(const FDynamicClassGenerationContext& Context, UObject* Object, const TSharedPtr<FJsonObject>& ObjectDefinition)
+{
+    // Deserialize property values for this object first
+    if (ObjectDefinition->HasTypedField<EJson::Object>(TEXT("property_values")))
+    {
+        const TSharedPtr<FJsonObject> PropertyValues = ObjectDefinition->GetObjectField(TEXT("property_values"));
+        DeserializeStructProperties(Object->GetClass(), Object, PropertyValues);
+    }
+
+    // Iterate over children and deserialize values for the ones that already exist as default subobjects
+    if (ObjectDefinition->HasTypedField<EJson::Array>(TEXT("children")))
+    {
+        const TArray<TSharedPtr<FJsonValue>>& Children = ObjectDefinition->GetArrayField(TEXT("children"));
+        for (const TSharedPtr<FJsonValue>& ChildJsonValue : Children)
+        {
+            const FString ChildPath = ChildJsonValue->AsString();
+            
+            // Parse object construction data and check if it is a default subobject
+            FDynamicObjectConstructionData ObjectConstructionData;
+            if (ParseObjectConstructionData(Context, ChildPath, ObjectConstructionData) && EnumHasAnyFlags(ObjectConstructionData.ObjectFlags, RF_DefaultSubObject))
             {
-                PropertyIterator->SetObjectPropertyValue_InContainer(Object, *ReplacementObjectPtr);
+                const TSharedPtr<FJsonObject> SubobjectDefinition = Context.GlobalObjectMap->GetObjectField(ChildPath);
+                UObject* SubobjectInstance = StaticFindObjectFast(ObjectConstructionData.ObjectClass, Object, ObjectConstructionData.ObjectName);
+
+                // If we have a constructed subobject instance, deserialize the properties into that instance
+                if (SubobjectDefinition && SubobjectInstance && SubobjectInstance->HasAnyFlags(RF_DefaultSubObject))
+                {
+                    DeserializeObjectAndSubobjectPropertyValuesRecursive(Context, SubobjectInstance, SubobjectDefinition);   
+                }
             }
         }
     }
@@ -1181,8 +1257,8 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
     checkf(ClassDefaultObjectDefinition.IsValid(), TEXT("Failed to find default object by path %s"), *ClassDefaultObjectPath);
 
     // Iterate child objects of the class default object to find default subobjects that we want to construct before we deserialize the data
-    FDynamicClassConstructionData ClassConstructionData;
-    TArray<TPair<FName, TSharedPtr<FJsonObject>>> ClassDefaultSubobjectNameToObjectDefinition;
+    FDynamicClassConstructionData& ClassConstructionData = DynamicClassConstructionData.Add(Class);
+    TSet<FName> CreatedDefaultSubobjects;
     
     const TArray<TSharedPtr<FJsonValue>>& Children = ClassDefaultObjectDefinition->GetArrayField(TEXT("children"));
     for (const TSharedPtr<FJsonValue>& ChildObjectPathValue : Children)
@@ -1197,36 +1273,41 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
                 FinalizeClass(Context, ChildObjectConstructionData.ObjectClass);
             }
             ClassConstructionData.DefaultSubobjects.Add(ChildObjectConstructionData);
-
-            const TSharedPtr<FJsonObject> ChildSubobjectDefinition = Context.GlobalObjectMap->GetObjectField(ChildPath);
-            ClassDefaultSubobjectNameToObjectDefinition.Add({ChildObjectConstructionData.ObjectName, ChildSubobjectDefinition});
+            CreatedDefaultSubobjects.Add(ChildObjectConstructionData.ObjectName);
+            
+            // Collect subobject overrides for this subobject
+            CollectNestedDefaultSubobjectTypeOverrides(Context, TArray<FName>(), ChildPath, ClassConstructionData.DefaultSubobjectOverrides);
         }
     }
-    DynamicClassConstructionData.Add(Class, ClassConstructionData);
+
+    // Iterate default subobjects of our parent native class. If we have not created one of them, it means it has been explicitly disabled
+    // TODO: This does not handle disabled nested default subobjects.
+    const UClass* NativeParentClass = GetNativeParentClassForDynamicClass(Class);
+    ForEachObjectWithOuter(NativeParentClass->GetDefaultObject(), [&](const UObject* ArchetypeDefaultSubobject)
+    {
+        if (ArchetypeDefaultSubobject->HasAnyFlags(RF_DefaultSubObject) && !CreatedDefaultSubobjects.Contains(ArchetypeDefaultSubobject->GetFName()))
+        {
+            ClassConstructionData.SuppressedDefaultSubobjects.Add(ArchetypeDefaultSubobject->GetFName());
+        }
+    }, false);
     
     // Assemble reference token stream for garbage collector
     Class->AssembleReferenceTokenStream(true);
     // Create class default object now that we have class object construction data
     UObject* ClassDefaultObject = Class->GetDefaultObject(true);
 
-    // Deserialize default object property values
-    if (ClassDefaultObjectDefinition->HasTypedField<EJson::Object>(TEXT("property_values")))
-    {
-        const TSharedPtr<FJsonObject> PropertyValues = ClassDefaultObjectDefinition->GetObjectField(TEXT("property_values"));
-        DeserializeStructProperties(Class, ClassDefaultObject, PropertyValues);
-    }
+    // Recursively deserialize property values for the default object and its subobjects (and their nested subobjects)
+    DeserializeObjectAndSubobjectPropertyValuesRecursive(Context, ClassDefaultObject, ClassDefaultObjectDefinition);
 
-    // Deserialize subobject property values
-    // TODO: This does not handle non-default values of default subobject nested subobjects. However, this is an incredibly rare case that is okay to ignore for now
-    for (const TPair<FName, TSharedPtr<FJsonObject>>& Pair : ClassDefaultSubobjectNameToObjectDefinition)
+    // Create an archetype by duplicating the CDO. We will use that archetype instead of CDO for priming the instances with correct values
+    const FString ArchetypeObjectName = TEXT("InitializationArchetype__") + Class->GetName();
     {
-        UObject* SubobjectTemplate = StaticFindObjectFast(UObject::StaticClass(), ClassDefaultObject, Pair.Key);
-        if (SubobjectTemplate && SubobjectTemplate->HasAnyFlags(RF_DefaultSubObject))
-        {
-            const TSharedPtr<FJsonObject> PropertyValues = Pair.Value->GetObjectField(TEXT("property_values"));
-            DeserializeStructProperties(SubobjectTemplate->GetClass(), SubobjectTemplate, PropertyValues);
-        }
+        FScopedAllowAbstractClassAllocation AllowAbstract;
+        ClassConstructionData.DefaultObjectArchetype = DuplicateObject(ClassDefaultObject, ClassDefaultObject->GetOuter(), *ArchetypeObjectName);
     }
+    ClassConstructionData.DefaultObjectArchetype->ClearFlags(RF_ClassDefaultObject);
+    ClassConstructionData.DefaultObjectArchetype->SetFlags(RF_Public | RF_ArchetypeObject | RF_Transactional);
+    ClassConstructionData.DefaultObjectArchetype->AddToRoot();
 }
 
 #undef LOCTEXT_NAMESPACE
