@@ -27,6 +27,7 @@ public class Suzie : ModuleRules
 				"Json",
 				"UnrealEd",
 				"Projects",
+				"BlueprintGraph",
 				"zlib",
 			}
 			);

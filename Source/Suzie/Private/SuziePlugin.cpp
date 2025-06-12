@@ -332,15 +332,20 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     {
         FString ChildPath = FunctionObjectPathValue->AsString();
         const TSharedPtr<FJsonObject> ChildObject = Context.GlobalObjectMap->GetObjectField(ChildPath);
-        if (ChildObject && ChildObject->GetStringField(TEXT("type")) == "Function")
+        if (ChildObject && ChildObject->GetStringField(TEXT("type")) == TEXT("Function"))
         {
             AddFunctionToClass(Context, NewClass, ChildPath);
         }
     }
 
     // Mark all dynamic classes as blueprintable and blueprint types, otherwise we will not be able to use them
-    NewClass->SetMetaData(FName("Blueprintable"), TEXT("true"));
-    NewClass->SetMetaData(FName("BlueprintType"), TEXT("true"));
+    NewClass->SetMetaData(FBlueprintMetadata::MD_AllowableBlueprintVariableType, TEXT("true"));
+    NewClass->SetMetaData(FBlueprintMetadata::MD_IsBlueprintBase, TEXT("true"));
+
+    if (NewClass->IsChildOf<UActorComponent>())
+    {
+        NewClass->SetMetaData(FBlueprintMetadata::MD_BlueprintSpawnableComponent, TEXT("true"));
+    }
 
     // Bind parent class to this class and link properties to calculate the class size
     NewClass->Bind();
@@ -435,7 +440,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     }
     
     // Mark all dynamic script structs as blueprint types
-    NewStruct->SetMetaData(FName("BlueprintType"), TEXT("true"));
+    NewStruct->SetMetaData(FBlueprintMetadata::MD_AllowableBlueprintVariableType, TEXT("true"));
 
     // Bind the newly created struct and link it to assign property offsets and calculate the size
     NewStruct->Bind();
@@ -502,7 +507,7 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     NewEnum->SetEnums(EnumNames, EnumCppForm, EnumFlags, false);
 
     // Mark all dynamic enums as blueprint types
-    NewEnum->SetMetaData(TEXT("BlueprintType"), TEXT("true"));
+    NewEnum->SetMetaData(*FBlueprintMetadata::MD_AllowableBlueprintVariableType.ToString(), TEXT("true"));
     
     UE_LOG(LogSuzie, Display, TEXT("Created enum: %s"), *ObjectName);
 
@@ -621,13 +626,13 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         // Object properties called WorldContext/WorldContextObject are automatically tagged as world context for convenience
         if (Property->IsA<FObjectProperty>() && (Property->GetFName() == TEXT("WorldContext") || Property->GetFName() == TEXT("WorldContextObject")))
         {
-            NewFunction->SetMetaData(TEXT("WorldContext"), *Property->GetName());
+            NewFunction->SetMetaData(FBlueprintMetadata::MD_WorldContext, *Property->GetName());
         }
         // Latent Info struct parameter properties should always be tagged as LatentInfo and indicate async BP functions
         if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct == FLatentActionInfo::StaticStruct())
         {
-            NewFunction->SetMetaData(TEXT("LatentInfo"), *Property->GetName());
-            NewFunction->SetMetaData(TEXT("Latent"), TEXT(""));
+            NewFunction->SetMetaData(FBlueprintMetadata::MD_LatentInfo, *Property->GetName());
+            NewFunction->SetMetaData(FBlueprintMetadata::MD_Latent, TEXT("true"));
         }
     }
 
@@ -813,29 +818,40 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     if (FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(NewProperty))
     {
         UClass* PropertyClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("property_class")));
-        ObjectPropertyBase->PropertyClass = PropertyClass;
+        // Fall back to UObject class if property class could not be found
+        ObjectPropertyBase->PropertyClass = PropertyClass ? PropertyClass : UObject::StaticClass();
         
         // Class properties additionally define MetaClass value
         if (FClassProperty* ClassProperty = CastField<FClassProperty>(NewProperty))
         {
             UClass* MetaClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("meta_class")));
-            ClassProperty->MetaClass = MetaClass;
+            // Fall back to UObject meta-class if meta-class could not be found
+            ClassProperty->MetaClass = MetaClass ? MetaClass : UObject::StaticClass();
         }
         else if (FSoftClassProperty* SoftClassProperty = CastField<FSoftClassProperty>(NewProperty))
         {
             UClass* MetaClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("meta_class")));
-            SoftClassProperty->MetaClass = MetaClass;
+            // Fall back to UObject meta-class if meta-class could not be found
+            SoftClassProperty->MetaClass = MetaClass ? MetaClass : UObject::StaticClass();
         }
+    }
+    else if (FInterfaceProperty* InterfaceProperty = CastField<FInterfaceProperty>(NewProperty))
+    {
+        UClass* InterfaceClass = FindOrCreateUnregisteredClass(Context, *PropertyJson->GetStringField(TEXT("interface_class")));
+        // Fall back to UInterface if interface class could not be found
+        InterfaceProperty->InterfaceClass = InterfaceClass ? InterfaceClass : UInterface::StaticClass();
     }
     else if (FStructProperty* StructProperty = CastField<FStructProperty>(NewProperty))
     {
         UScriptStruct* Struct = FindOrCreateScriptStruct(Context, PropertyJson->GetStringField(TEXT("struct")));
-        StructProperty->Struct = Struct;
+        // Fall back to FVector if struct class could not be found
+        StructProperty->Struct = Struct ? Struct : TBaseStructure<FVector>::Get();
     }
     else if (FEnumProperty* EnumProperty = CastField<FEnumProperty>(NewProperty))
     {
         UEnum* Enum = FindOrCreateEnum(Context, PropertyJson->GetStringField(TEXT("enum")));
-        EnumProperty->SetEnum(Enum);
+        // Fall back to EMovementMode if enum class could not be found
+        EnumProperty->SetEnum(Enum ? Enum : StaticEnum<EMovementMode>());
 
         FProperty* UnderlyingProp = BuildProperty(Context, EnumProperty, PropertyJson->GetObjectField(TEXT("container")));
         EnumProperty->AddCppProperty(UnderlyingProp);
@@ -846,27 +862,29 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         if (PropertyJson->HasTypedField<EJson::String>(TEXT("enum")))
         {
             UEnum* Enum = FindOrCreateEnum(Context, PropertyJson->GetStringField(TEXT("enum")));
-            ByteProperty->Enum = Enum;
+            // Fall back to EMovementMode if enum class could not be found
+            ByteProperty->Enum = Enum ? Enum : StaticEnum<EMovementMode>();
         }
     }
     else if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(NewProperty))
     {
         UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
-        DelegateProperty->SignatureFunction = SignatureFunction;
+        // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
+        DelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
     }
     else if (FMulticastDelegateProperty* MulticastDelegateProperty = CastField<FMulticastDelegateProperty>(NewProperty))
     {
         UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
-        MulticastDelegateProperty->SignatureFunction = SignatureFunction;
+        // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
+        MulticastDelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
     }
     else if (FFieldPathProperty* FieldPathProperty = CastField<FFieldPathProperty>(NewProperty))
     {
         if (PropertyJson->HasTypedField<EJson::String>(TEXT("property_class")))
         {
-            if (FFieldClass* const* PropertyClass = FFieldClass::GetNameToFieldClassMap().Find(TEXT("property_class")))
-            {
-                FieldPathProperty->PropertyClass = *PropertyClass;   
-            }
+            FFieldClass* const* PropertyClassPtr = FFieldClass::GetNameToFieldClassMap().Find(TEXT("property_class"));
+            // Fall back to FProperty if property class could not be found
+            FieldPathProperty->PropertyClass = PropertyClassPtr ? *PropertyClassPtr : FProperty::StaticClass();   
         }
     }
     else
@@ -1369,14 +1387,18 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
     DeserializeObjectAndSubobjectPropertyValuesRecursive(Context, ClassDefaultObject, ClassDefaultObjectDefinition);
 
     // Create an archetype by duplicating the CDO. We will use that archetype instead of CDO for priming the instances with correct values
-    const FString ArchetypeObjectName = TEXT("InitializationArchetype__") + Class->GetName();
+    // Do not create archetypes for NetConnection-derived classes, they have faulty shutdown logic leading to a crash on exit
+    if (!Class->IsChildOf<UNetConnection>())
     {
-        FScopedAllowAbstractClassAllocation AllowAbstract;
-        ClassConstructionData.DefaultObjectArchetype = DuplicateObject(ClassDefaultObject, ClassDefaultObject->GetOuter(), *ArchetypeObjectName);
+        const FString ArchetypeObjectName = TEXT("InitializationArchetype__") + Class->GetName();
+        {
+            FScopedAllowAbstractClassAllocation AllowAbstract;
+            ClassConstructionData.DefaultObjectArchetype = DuplicateObject(ClassDefaultObject, ClassDefaultObject->GetOuter(), *ArchetypeObjectName);
+        }
+        ClassConstructionData.DefaultObjectArchetype->ClearFlags(RF_ClassDefaultObject);
+        ClassConstructionData.DefaultObjectArchetype->SetFlags(RF_Public | RF_ArchetypeObject | RF_Transactional);
+        ClassConstructionData.DefaultObjectArchetype->AddToRoot();
     }
-    ClassConstructionData.DefaultObjectArchetype->ClearFlags(RF_ClassDefaultObject);
-    ClassConstructionData.DefaultObjectArchetype->SetFlags(RF_Public | RF_ArchetypeObject | RF_Transactional);
-    ClassConstructionData.DefaultObjectArchetype->AddToRoot();
 }
 
 #undef LOCTEXT_NAMESPACE
