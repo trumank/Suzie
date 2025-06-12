@@ -211,7 +211,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         ClassFlags,
         CASTCLASS_None,
         UObject::StaticConfigName(),
-        RF_Public | RF_Transient | RF_MarkAsRootSet,
+        RF_Public | RF_MarkAsRootSet,
         &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper,
         ParentClass->ClassVTableHelperCtorCaller,
         MoveTemp(ClassStaticFunctions));
@@ -335,7 +335,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     // Create a package for the struct or reuse the existing package. Make sure it's marked as Native package
     UPackage* Package = FindOrCreatePackage(Context, PackageName);
     
-    UScriptStruct* NewStruct = NewObject<UScriptStruct>(Package, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
+    UScriptStruct* NewStruct = NewObject<UScriptStruct>(Package, *ObjectName, RF_Public | RF_MarkAsRootSet);
 
     // Set super script struct and copy inheritable flags first if this struct has a parent (most structs do not)
     if (SuperScriptStruct != nullptr)
@@ -415,7 +415,7 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     // Create a package for the struct or reuse the existing package. Make sure it's marked as Native package
     UPackage* Package = FindOrCreatePackage(Context, PackageName);
     
-    UEnum* NewEnum = NewObject<UEnum>(Package, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet);
+    UEnum* NewEnum = NewObject<UEnum>(Package, *ObjectName, RF_Public | RF_MarkAsRootSet);
 
     // Set CppType. It is generally not used by the engine, but is useful to determine whenever enum is namespaced or not for CppForm deduction
     NewEnum->CppType = EnumDefinition->GetStringField(TEXT("cpp_type"));
@@ -536,7 +536,7 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     }
 
     // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
-    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_Transient | RF_MarkAsRootSet | RF_ArchetypeObject);
+    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
     NewFunction->ClearFlags(RF_ArchetypeObject);
     NewFunction->FunctionFlags |= FunctionFlags;
 
@@ -1142,8 +1142,8 @@ void FSuziePluginModule::PolymorphicClassConstructorPostPropertyInitCallback(UOb
     // TODO: Nested subobjects could theoretically also hold references to instanced subobjects, and instanced subobjects can hold references to the nested subobjects
     // TODO: We do not have enough context here to perform multi-level instancing, so such references are not currently handled and will point to the template even after construction
     TArray<UObject*> ObjectsToReplaceReferencesWithin;
+    TemplateToSubobjectMap.GenerateValueArray(ObjectsToReplaceReferencesWithin);
     ObjectsToReplaceReferencesWithin.Add(ConstructedObject);
-    
 
     // Replace references to templates with references to instanced subobjects for the constructed object graph
     for (UObject* Object : ObjectsToReplaceReferencesWithin)
