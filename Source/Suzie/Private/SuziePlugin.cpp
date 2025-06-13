@@ -199,6 +199,21 @@ UPackage* FSuziePluginModule::FindOrCreatePackage(FDynamicClassGenerationContext
     return Package;
 }
 
+UClass* FSuziePluginModule::GetPlaceholderNonNativePropertyOwnerClass()
+{
+    static UBlueprintGeneratedClass* PlaceholderNonNativeOwnerClass = nullptr;
+    if (PlaceholderNonNativeOwnerClass == nullptr)
+    {
+        PlaceholderNonNativeOwnerClass = NewObject<UBlueprintGeneratedClass>(GetTransientPackage(), TEXT("SuziePlaceholderBlueprintClass"), RF_Public | RF_Transient | RF_MarkAsRootSet);
+        PlaceholderNonNativeOwnerClass->SetSuperStruct(UObject::StaticClass());
+        PlaceholderNonNativeOwnerClass->ClassFlags = CLASS_Abstract | CLASS_Hidden | CLASS_Transient;
+
+        PlaceholderNonNativeOwnerClass->Bind();
+        PlaceholderNonNativeOwnerClass->StaticLink(true);
+    }
+    return PlaceholderNonNativeOwnerClass;
+}
+
 UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGenerationContext& Context, const FString& ClassPath)
 {
     // Attempt to find an existing class first
@@ -240,7 +255,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     };
 
     // Convert class flag names to the class flags bitmask
-    EClassFlags ClassFlags = CLASS_None;
+    EClassFlags ClassFlags = CLASS_Native | CLASS_Intrinsic;
     const TSet<FString> ClassFlagNames = ParseFlags(ClassDefinition->GetStringField(TEXT("class_flags")));
     for (const auto& [ClassFlagName, ClassFlagBit] : ClassFlagNameLookup)
     {
@@ -265,16 +280,15 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         ClassFlags,
         CASTCLASS_None,
         UObject::StaticConfigName(),
-        RF_Public | RF_MarkAsRootSet,
+        RF_Public | RF_MarkAsNative | RF_MarkAsRootSet,
         &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper,
         ParentClass->ClassVTableHelperCtorCaller,
         MoveTemp(ClassStaticFunctions));
-    // Remove CLASS_Native flag that was set implicitly by the class constructor
-    ConstructedClassObject->ClassFlags &= (~CLASS_Native);
 
     //Set super structure and ClassWithin (they are required prior to registering)
     ConstructedClassObject->SetSuperStruct(ParentClass);
     ConstructedClassObject->ClassWithin = UObject::StaticClass();
+    ConstructedClassObject->TotalFieldCount = ParentClass->TotalFieldCount;
 
     //Field with cpp type info only exists in editor, in shipping SetCppTypeInfoStatic is empty
     static const FCppClassTypeInfoStatic TypeInfoStatic{false};
@@ -289,6 +303,47 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     UE_LOG(LogSuzie, Verbose, TEXT("Created dynamic class: %s"), *ClassName);
     return ConstructedClassObject;
 }
+
+// Accessor to allow calling SetOffset_Internal on property objects
+class FPropertyAccessor : public FProperty
+{
+public:
+    FPropertyAccessor() = delete;
+    static void SetPropertyOffsetDirect(FProperty* InProperty, const int32 NewOffset)
+    {
+        static_cast<FPropertyAccessor*>(InProperty)->SetOffset_Internal(NewOffset);
+    }
+};
+
+// Internal property type injected into DestructorLink of dynamic classes to force the destruction of their properties (despite the class being marked as native)
+class FDynamicClassDestructorCallProperty : public FProperty
+{
+    TArray<const FProperty*> PropertiesToDestroy;
+public:
+    explicit FDynamicClassDestructorCallProperty(UClass* InOwner, const TArray<const FProperty*>& InPropertiesToDestroy) :
+        FProperty(InOwner, TEXT("DynamicClassDestructorCall"), RF_Public),
+        PropertiesToDestroy(InPropertiesToDestroy)
+    {
+        PropertyFlags |= CPF_ZeroConstructor;
+        SetElementSize(0);
+    }
+    virtual void LinkInternal(FArchive& Ar) override {}
+    virtual void DestroyValueInternal(void* Dest) const override {}
+    virtual bool ContainsClearOnFinishDestroyInternal(TArray<const FStructProperty*>& EncounteredStructProps) const override { return true; }
+    
+    virtual void FinishDestroyInternal(void* Data) const override
+    {
+        checkf(GetOffset_ForInternal() == 0, TEXT("Dynamic class destructor call property expected to be at offset 0 in the class"));
+        for (const FProperty* Property : PropertiesToDestroy)
+        {
+            Property->DestroyValue_InContainer(Data);
+        }
+    }
+};
+
+// Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
+// so we do not need an explicit mutex to guard the access to it during class initialization
+static TMap<UClass*, FDynamicClassConstructionData> DynamicClassConstructionData;
 
 UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Context, const FString& ClassPath)
 {
@@ -317,13 +372,33 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
 
     const TSharedPtr<FJsonObject> ClassDefinition = Context.GlobalObjectMap->GetObjectField(ClassPath);
 
+    TArray<const FProperty*> PropertiesWithDestructor;
+    TArray<const FProperty*> PropertiesWithConstructor;
+    FArchive EmptyPropertyLinkArchive;
+
     // Add properties to the class
     const TArray<TSharedPtr<FJsonValue>>& Properties = ClassDefinition->GetArrayField(TEXT("properties"));
     for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
     {
         // We want all properties to be editable, visible and blueprint assignable
         const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintAssignable;
-        AddPropertyToStruct(Context, NewClass, PropertyDescriptor->AsObject(), ExtraPropertyFlags);
+        if (FProperty* CreatedProperty = AddPropertyToStruct(Context, NewClass, PropertyDescriptor->AsObject(), ExtraPropertyFlags))
+        {
+            // Because this is a native class, we have to link the property offset manually here rather than expecting StaticLink to do it for us
+            NewClass->PropertiesSize = CreatedProperty->Link(EmptyPropertyLinkArchive);
+            NewClass->MinAlignment = FMath::Max(NewClass->MinAlignment, CreatedProperty->GetMinAlignment());
+            NewClass->TotalFieldCount++;
+
+            // Add property into the constructor/destructor lists based on its flags
+            if (!CreatedProperty->HasAnyPropertyFlags(CPF_IsPlainOldData | CPF_NoDestructor))
+            {
+                PropertiesWithDestructor.Add(CreatedProperty);
+            }
+            if (!CreatedProperty->HasAnyPropertyFlags(CPF_ZeroConstructor))
+            {
+                PropertiesWithConstructor.Add(CreatedProperty);
+            }
+        }
     }
 
     // Add functions to the class
@@ -347,10 +422,22 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
         NewClass->SetMetaData(FBlueprintMetadata::MD_BlueprintSpawnableComponent, TEXT("true"));
     }
 
-    // Bind parent class to this class and link properties to calculate the class size
+    // Bind parent class to this class and link properties to calculate their runtime derived data
     NewClass->Bind();
-    NewClass->StaticLink(true);
+    NewClass->StaticLink();
     NewClass->SetSparseClassDataStruct(NewClass->GetSparseClassDataArchetypeStruct());
+
+    // If we have properties that need destructor call, we add a synthetic property of custom type to DestructorLink
+    if (!PropertiesWithDestructor.IsEmpty())
+    {
+        FProperty* DestructorCallProperty = new FDynamicClassDestructorCallProperty(NewClass, PropertiesWithDestructor);
+        DestructorCallProperty->DestructorLinkNext = NewClass->DestructorLink;
+        NewClass->DestructorLink = DestructorCallProperty;
+    }
+
+    // Stash the properties that need to be constructed on the class data so polymorphic constructor can access them easily
+    FDynamicClassConstructionData& ClassConstructionData = DynamicClassConstructionData.FindOrAdd(NewClass);
+    ClassConstructionData.PropertiesToConstruct = PropertiesWithConstructor;
 
     const FString ClassDefaultObjectPath = ClassDefinition->GetStringField(TEXT("class_default_object"));
     
@@ -427,17 +514,6 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
         const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintAssignable;
         AddPropertyToStruct(Context, NewStruct, PropertyDescriptor->AsObject(), ExtraPropertyFlags);
     }
-
-    // If we have not created any properties and this struct has no parent, we have to create a dummy one since structs cannot have a size of zero
-    if (SuperScriptStruct == nullptr && NewStruct->ChildProperties == nullptr)
-    {
-        // Mark it as transient, non-transactional and deprecated to avoid it being serialized
-        FProperty* NewProperty = CastField<FProperty>(FByteProperty::Construct(NewStruct, TEXT("DummyByteProperty"), RF_Public));
-        NewProperty->PropertyFlags |= CPF_NativeAccessSpecifierPrivate | CPF_Transient | CPF_NonTransactional | CPF_Deprecated;
-
-        NewProperty->Next = nullptr;
-        NewStruct->ChildProperties = NewProperty;
-    }
     
     // Mark all dynamic script structs as blueprint types
     NewStruct->SetMetaData(FBlueprintMetadata::MD_AllowableBlueprintVariableType, TEXT("true"));
@@ -446,6 +522,13 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     NewStruct->Bind();
     NewStruct->PrepareCppStructOps();
     NewStruct->StaticLink(true);
+
+    // The engine does not gracefully handle empty structs, so force the struct size to be at least one byte
+    if (NewStruct->GetPropertiesSize() == 0)
+    {
+        NewStruct->MinAlignment = 1;
+        NewStruct->SetPropertiesSize(1);
+    }
     
     UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
 
@@ -672,7 +755,7 @@ TSet<FString> FSuziePluginModule::ParseFlags(const FString& Flags)
     return ReturnFlags;
 }
 
-void FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContext& Context, UStruct* Struct, const TSharedPtr<FJsonObject>& PropertyJson, const EPropertyFlags ExtraPropertyFlags)
+FProperty* FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContext& Context, UStruct* Struct, const TSharedPtr<FJsonObject>& PropertyJson, const EPropertyFlags ExtraPropertyFlags)
 {
     if (FProperty* NewProperty = BuildProperty(Context, Struct, PropertyJson, ExtraPropertyFlags))
     {
@@ -695,7 +778,9 @@ void FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContext& Con
             Struct->ChildProperties = NewProperty;
         }
         UE_LOG(LogSuzie, VeryVerbose, TEXT("Added property %s to struct %s"), *NewProperty->GetName(), *Struct->GetName());
+        return NewProperty;
     }
+    return nullptr;
 }
 
 void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, const EFunctionFlags ExtraFunctionFlags)
@@ -1173,10 +1258,6 @@ UClass* FSuziePluginModule::GetNativeParentClassForDynamicClass(const UClass* In
     return NativeParentClass;
 }
 
-// Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
-// so we do not need an explicit mutex to guard the access to it during class initialization
-static TMap<UClass*, FDynamicClassConstructionData> DynamicClassConstructionData;
-
 UClass* FSuziePluginModule::GetDynamicParentClassForBlueprintClass(UClass* InBlueprintClass)
 {
     // Find the polymorphic class we are currently constructing, in case this is a derived blueprint class
@@ -1199,47 +1280,78 @@ struct FObjectInitializerAccessStub
 void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer)
 {
     const UClass* NativeParentClass = GetNativeParentClassForDynamicClass(ObjectInitializer.GetClass());
-    const UClass* CurrentClass = GetDynamicParentClassForBlueprintClass(ObjectInitializer.GetClass());
-    
-    // We must have valid construction data for all dynamic classes
-    const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(CurrentClass);
-    checkf(ClassConstructionData, TEXT("Failed to find dynamic class construction data for class %s"), *CurrentClass->GetPathName());
+    const UClass* TopLevelDynamicClass = GetDynamicParentClassForBlueprintClass(ObjectInitializer.GetClass());
 
-    // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
-    // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
-    // This has to be done before we call the parent constructor and create any default subobjects
-    if ((ObjectInitializer.GetArchetype() == nullptr || ObjectInitializer.GetArchetype() == ObjectInitializer.GetClass()->ClassDefaultObject) && ClassConstructionData->DefaultObjectArchetype)
+    // We must have valid construction data for all dynamic classes
+    const FDynamicClassConstructionData* TopLevelClassConstructionData = DynamicClassConstructionData.Find(TopLevelDynamicClass);
+    checkf(TopLevelClassConstructionData, TEXT("Failed to find dynamic class construction data for dynamic class %s"), *TopLevelDynamicClass->GetPathName());
+
+    // Run logic necessary for the top level dynamic class object. That includes setting up defautl subobject overrides and the active archetype to use for property copying
     {
-        FObjectInitializerAccessStub* ObjectInitializerAccess = reinterpret_cast<FObjectInitializerAccessStub*>(&ObjectInitializer.Get());
-        ObjectInitializerAccess->ObjectArchetype = ClassConstructionData->DefaultObjectArchetype;
-        ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
-    }
-    
-    // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
-    for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
-    {
-        // ReSharper disable once CppExpressionWithoutSideEffects
-        ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
-    }
-    // Disable creation of certain subobjects that this class does not want to have
-    for (const FName& DisabledSubobjectName : ClassConstructionData->SuppressedDefaultSubobjects)
-    {
-        // ReSharper disable once CppExpressionWithoutSideEffects
-        ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
-    }
-    
-    // Also apply overrides for nested subobject types. These are very rare but should be handled regardless
-    // TODO: We do not handle disabled nested default subobjects currently. Case is extremely rare and nested subobjects are extremely rare themselves, so this can be revised later
-    for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : ClassConstructionData->DefaultSubobjectOverrides)
-    {
-        // ReSharper disable once CppExpressionWithoutSideEffects
-        ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
+        // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
+        // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
+        // This has to be done before we call the parent constructor and create any default subobjects
+        if ((ObjectInitializer.GetArchetype() == nullptr || ObjectInitializer.GetArchetype() == ObjectInitializer.GetClass()->ClassDefaultObject) && TopLevelClassConstructionData->DefaultObjectArchetype)
+        {
+            FObjectInitializerAccessStub* ObjectInitializerAccess = reinterpret_cast<FObjectInitializerAccessStub*>(&ObjectInitializer.Get());
+            ObjectInitializerAccess->ObjectArchetype = TopLevelClassConstructionData->DefaultObjectArchetype;
+            ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
+        }
+        
+        // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
+        for (const FDynamicObjectConstructionData& SubobjectConstructionData : TopLevelClassConstructionData->DefaultSubobjects)
+        {
+            // ReSharper disable once CppExpressionWithoutSideEffects
+            ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
+        }
+        // Disable creation of certain subobjects that this class does not want to have
+        for (const FName& DisabledSubobjectName : TopLevelClassConstructionData->SuppressedDefaultSubobjects)
+        {
+            // ReSharper disable once CppExpressionWithoutSideEffects
+            ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
+        }
+        
+        // Also apply overrides for nested subobject types. These are very rare but should be handled regardless
+        // TODO: We do not handle disabled nested default subobjects currently. Case is extremely rare and nested subobjects are extremely rare themselves, so this can be revised later
+        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : TopLevelClassConstructionData->DefaultSubobjectOverrides)
+        {
+            // ReSharper disable once CppExpressionWithoutSideEffects
+            ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
+        }
     }
     
     // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
     NativeParentClass->ClassConstructor(ObjectInitializer);
 
-    // Create missing default subobjects and add them to the template to subobject map
+    // Gather all dynamic classes that contribute to the object being constructed, starting at the top level one
+    TArray<const UClass*, TInlineAllocator<8>> DynamicClassHierarchyTree;
+    const UClass* CurrentDynamicClass = TopLevelDynamicClass;
+    while (CurrentDynamicClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
+    {
+        DynamicClassHierarchyTree.Add(CurrentDynamicClass);
+        CurrentDynamicClass = CurrentDynamicClass->GetSuperClass();
+    }
+
+    // Run constructors for each dynamic class in reverse order, e.g. from the furthest parent to the top level class
+    for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
+    {
+        ExecutePolymorphicClassConstructorFrameForDynamicClass(ObjectInitializer, DynamicClassHierarchyTree[i]);
+    }
+}
+
+void FSuziePluginModule::ExecutePolymorphicClassConstructorFrameForDynamicClass(const FObjectInitializer& ObjectInitializer, const UClass* DynamicClass)
+{
+    // We must have valid construction data for all dynamic classes
+    const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(DynamicClass);
+    checkf(ClassConstructionData, TEXT("Failed to find dynamic class construction data for dynamic class %s"), *DynamicClass->GetPathName());
+
+    // Run property initializers for properties defined in this class that need constructor calls
+    for (const FProperty* Property : ClassConstructionData->PropertiesToConstruct)
+    {
+        Property->InitializeValue_InContainer(ObjectInitializer.GetObj());
+    }
+    
+    // Create missing default subobjects for this dynamic class type
     for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
     {
         if (StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
@@ -1344,7 +1456,7 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
     checkf(ClassDefaultObjectDefinition.IsValid(), TEXT("Failed to find default object by path %s"), *ClassDefaultObjectPath);
 
     // Iterate child objects of the class default object to find default subobjects that we want to construct before we deserialize the data
-    FDynamicClassConstructionData& ClassConstructionData = DynamicClassConstructionData.Add(Class);
+    FDynamicClassConstructionData& ClassConstructionData = DynamicClassConstructionData.FindOrAdd(Class);
     TSet<FName> CreatedDefaultSubobjects;
     
     const TArray<TSharedPtr<FJsonValue>>& Children = ClassDefaultObjectDefinition->GetArrayField(TEXT("children"));
@@ -1403,4 +1515,4 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
 
 #undef LOCTEXT_NAMESPACE
 
-IMPLEMENT_MODULE(FSuziePluginModule, DynamicReflectionPlugin)
+IMPLEMENT_MODULE(FSuziePluginModule, Suzie);

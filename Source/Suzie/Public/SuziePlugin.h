@@ -32,6 +32,8 @@ struct FNestedDefaultSubobjectOverrideData
 
 struct FDynamicClassConstructionData
 {
+    // List of properties (not including super class properties) that must be constructed with InitializeValue call
+    TArray<const FProperty*> PropertiesToConstruct;
     // Names of default subobjects that our native parent class defines but that we do not want to be created
     TArray<FName> SuppressedDefaultSubobjects;
     // Note that this will also contain all subobjects defined in parent classes
@@ -61,6 +63,7 @@ private:
     TSharedPtr<FSlateStyleSet> PluginStyle;
 
     UPackage* FindOrCreatePackage(FDynamicClassGenerationContext& Context, const FString& PackageName);
+    static UClass* GetPlaceholderNonNativePropertyOwnerClass();
     UClass* FindOrCreateUnregisteredClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UClass* FindOrCreateClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UScriptStruct* FindOrCreateScriptStruct(FDynamicClassGenerationContext& Context, const FString& StructPath);
@@ -70,6 +73,7 @@ private:
     static UClass* GetNativeParentClassForDynamicClass(const UClass* InDynamicClass);
     static UClass* GetDynamicParentClassForBlueprintClass(UClass* InBlueprintClass);
     static void PolymorphicClassConstructorInvocationHelper(const FObjectInitializer& ObjectInitializer);
+    static void ExecutePolymorphicClassConstructorFrameForDynamicClass(const FObjectInitializer& ObjectInitializer, const UClass* DynamicClass);
 
     static bool ParseObjectConstructionData(const FDynamicClassGenerationContext& Context, const FString& ObjectPath, FDynamicObjectConstructionData& ObjectConstructionData);
     void DeserializeStructProperties(const UStruct* Struct, void* StructData, const TSharedPtr<FJsonObject>& PropertyValues);
@@ -85,7 +89,7 @@ private:
     static void ParseObjectPath(const FString& ObjectPath, FString& OutOuterObjectPath, FString& OutObjectName);
     static TSet<FString> ParseFlags(const FString& Flags);
 
-    void AddPropertyToStruct(FDynamicClassGenerationContext& Context, UStruct* Struct, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
+    FProperty* AddPropertyToStruct(FDynamicClassGenerationContext& Context, UStruct* Struct, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
     void AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, EFunctionFlags ExtraFunctionFlags = FUNC_None);
 
     FProperty* BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags = CPF_None);
