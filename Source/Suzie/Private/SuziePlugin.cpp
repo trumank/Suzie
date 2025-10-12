@@ -148,6 +148,15 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
         FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
         if (Type == TEXT("Class"))
         {
+            // Meatloaf bug (commit d8179e8): CDOs of UClass-derived native classes will be labeled with Class type, instead of "Object" type, which will result in a crash
+            // down the line due to the CDO being created with the wrong class type
+            FString PackageName;
+            FString ClassName;
+            ParseObjectPath(ObjectPath, PackageName, ClassName);
+            if (ClassName.StartsWith(TEXT("Default__")))
+            {
+                continue;
+            }
             UE_LOG(LogSuzie, Verbose, TEXT("Creating class %s"), *ObjectPath);
             FindOrCreateClass(ClassGenerationContext, ObjectPath);
         }
@@ -221,15 +230,24 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     {
         return ExistingClass;
     }
+    // We need to handle this case here because of the possibility of native class having a function that requries a child class as an argument
+    if (Context.UnregisteredDynamicClassConstructionStack.Contains(ClassPath))
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("Attempt to re-entry into unregistered class construction for class %s. Likely cause is a parent class using child class as a function argument"), *ClassPath);
+        return nullptr;
+    }
+    Context.UnregisteredDynamicClassConstructionStack.Add(ClassPath);
     
     const TSharedPtr<FJsonObject> ClassDefinition = Context.GlobalObjectMap->GetObjectField(ClassPath);
     checkf(ClassDefinition.IsValid(), TEXT("Failed to find class object by path %s"), *ClassPath);
     
     const FString ObjectType = ClassDefinition->GetStringField(TEXT("type"));
     checkf(ObjectType == TEXT("Class"), TEXT("FindOrCreateUnregisteredClass expected Class object %s, got object of type %s"), *ClassPath, *ObjectType);
-    
+
+    // Meatloaf bug (commit d8179e8): UClass-derived native classes will produce Null super_struct, which will crash Suzie down the line
+    // Attempt to recover by assuming UClass parent in this case for this class
     const FString ParentClassPath = ClassDefinition->GetStringField(TEXT("super_struct"));
-    UClass* ParentClass = FindOrCreateClass(Context, ParentClassPath);
+    UClass* ParentClass = ParentClassPath.IsEmpty() ? UClass::StaticClass() : FindOrCreateClass(Context, ParentClassPath);
     if (!ParentClass)
     {
         UE_LOG(LogSuzie, Error, TEXT("Parent class not found: %s"), *ParentClassPath);
@@ -288,7 +306,10 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     //Set super structure and ClassWithin (they are required prior to registering)
     ConstructedClassObject->SetSuperStruct(ParentClass);
     ConstructedClassObject->ClassWithin = UObject::StaticClass();
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
+    // Added in 5.5, needs to be carried over from the parent class
     ConstructedClassObject->TotalFieldCount = ParentClass->TotalFieldCount;
+#endif
 
     //Field with cpp type info only exists in editor, in shipping SetCppTypeInfoStatic is empty
     static const FCppClassTypeInfoStatic TypeInfoStatic{false};
@@ -299,8 +320,9 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     ConstructedClassObject->DeferredRegister(UClass::StaticClass(), *PackageName, *ClassName);
 
     Context.ClassesPendingConstruction.Add(ConstructedClassObject, ClassPath);
+    Context.UnregisteredDynamicClassConstructionStack.Remove(ClassPath);
     
-    UE_LOG(LogSuzie, Verbose, TEXT("Created dynamic class: %s"), *ClassName);
+    UE_LOG(LogSuzie, Verbose, TEXT("Created dynamic class: %s"), *ClassPath);
     return ConstructedClassObject;
 }
 
@@ -325,12 +347,21 @@ public:
         PropertiesToDestroy(InPropertiesToDestroy)
     {
         PropertyFlags |= CPF_ZeroConstructor;
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
+        // 5.5 Deprecated direct access to ElementSize, so use SetElementSize instead
         SetElementSize(0);
+#else
+        // Access ElementSize directly for versions below 5.5
+        ElementSize = 0;
+#endif
     }
     virtual void LinkInternal(FArchive& Ar) override {}
+
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
+    // 5.5 Changed logic in UObject::DestroyNonNativeProperties to call FinishDestroy_InContainer instead of DestroyValue_InContainer for Native/Intrinsic classes
+    // So for versions above 5.5 we need to override FinishDestroy and ContainsClearOnFinishDestroy rather than DestroyValueInternal
     virtual void DestroyValueInternal(void* Dest) const override {}
     virtual bool ContainsClearOnFinishDestroyInternal(TArray<const FStructProperty*>& EncounteredStructProps) const override { return true; }
-    
     virtual void FinishDestroyInternal(void* Data) const override
     {
         checkf(GetOffset_ForInternal() == 0, TEXT("Dynamic class destructor call property expected to be at offset 0 in the class"));
@@ -339,6 +370,18 @@ public:
             Property->DestroyValue_InContainer(Data);
         }
     }
+#else
+    // For versions below 5.5 UObject::DestroyNonNativeProperties unconditionally calls DestroyValue_InContainer for all properties in destructor link,
+    // so we can just override DestroyValue to hook into the destruction logic of the class
+    virtual void DestroyValueInternal(void* Dest) const override
+    {
+        checkf(GetOffset_ForInternal() == 0, TEXT("Dynamic class destructor call property expected to be at offset 0 in the class"));
+        for (const FProperty* Property : PropertiesToDestroy)
+        {
+            Property->DestroyValue_InContainer(Dest);
+        }
+    }
+#endif
 };
 
 // Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
@@ -387,7 +430,10 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
             // Because this is a native class, we have to link the property offset manually here rather than expecting StaticLink to do it for us
             NewClass->PropertiesSize = CreatedProperty->Link(EmptyPropertyLinkArchive);
             NewClass->MinAlignment = FMath::Max(NewClass->MinAlignment, CreatedProperty->GetMinAlignment());
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
+            // Added in 5.5, needs to be incremented for each new property added to the class
             NewClass->TotalFieldCount++;
+#endif
 
             // Add property into the constructor/destructor lists based on its flags
             if (!CreatedProperty->HasAnyPropertyFlags(CPF_IsPlainOldData | CPF_NoDestructor))
@@ -871,7 +917,10 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         {TEXT("CPF_NativeAccessSpecifierPrivate"), CPF_NativeAccessSpecifierPrivate},
         {TEXT("CPF_SkipSerialization"), CPF_SkipSerialization},
         {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
+        // Added in 5.5, allows references to the current object from within the property
         {TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference},
+#endif
         // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
         {TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash},
     };

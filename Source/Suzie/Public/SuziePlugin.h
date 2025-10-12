@@ -15,6 +15,10 @@ struct FDynamicClassGenerationContext
     TMap<UClass*, FString> ClassesPendingConstruction;
     // Value is the object path of the class default object
     TMap<UClass*, FString> ClassesPendingFinalization;
+    // Lookup of dynamic classes that are currently being constructed by FindOrCreateUnregisteredClass
+    // Needed to handle edge case of re-entry when a parent class declares a function that takes a child class as an argument
+    // We do not support this case fully, but we need to track it to avoid creating the same class multiple times
+    TSet<FString> UnregisteredDynamicClassConstructionStack;
 };
 
 struct FDynamicObjectConstructionData
