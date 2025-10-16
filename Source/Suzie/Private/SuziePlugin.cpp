@@ -1,5 +1,4 @@
 #include "SuziePlugin.h"
-
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -103,9 +102,9 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
     for (const FString& CompressedJsonFileName : CompressedJsonFileNames)
     {
         GenerateDynamicClassesTask.EnterProgressFrame(1, FText::Format(LOCTEXT("ProcessingJsonFile", "Generating classes for file {0}"), FText::AsCultureInvariant(CompressedJsonFileName)));
-        #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3    
-                GenerateDynamicClassesTask.ForceRefresh();
-        #endif
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3    
+        GenerateDynamicClassesTask.ForceRefresh();
+#endif
         UE_LOG(LogSuzie, Display, TEXT("Processing compressed JSON class definition: %s"), *CompressedJsonFileName);
 
         // Read binary file contents
