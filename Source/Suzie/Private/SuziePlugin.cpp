@@ -15,9 +15,13 @@
 #include "Engine/EngineTypes.h"
 #include "PropertyEditorModule.h"
 #include "SuzieDecompressionHelper.h"
-#include "UObject/PropertyOptional.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "UObject/UObjectAllocator.h"
+#include "Misc/ScopedSlowTask.h"
+#include "Engine/NetConnection.h"
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+#include "UObject/PropertyOptional.h"
+#endif
 
 DEFINE_LOG_CATEGORY(LogSuzie);
 
@@ -60,14 +64,19 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
     // This can potentially take some time so show a progress task
     const int32 TotalAmountOfWork = JsonFileNames.Num() + CompressedJsonFileNames.Num();
     FScopedSlowTask GenerateDynamicClassesTask(TotalAmountOfWork, LOCTEXT("GeneratingDynamicClasses", "Suzie: Generating Dynamic Classes"));
+    GenerateDynamicClassesTask.Visibility = ESlowTaskVisibility::ForceVisible;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3    
     GenerateDynamicClassesTask.Visibility = ESlowTaskVisibility::Important;
     GenerateDynamicClassesTask.ForceRefresh();
+#endif
     
     // Process each JSON file
     for (const FString& JsonFileName : JsonFileNames)
     {
         GenerateDynamicClassesTask.EnterProgressFrame(1, FText::Format(LOCTEXT("ProcessingJsonFile", "Generating classes for file {0}"), FText::AsCultureInvariant(JsonFileName)));
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3    
         GenerateDynamicClassesTask.ForceRefresh();
+#endif
         UE_LOG(LogSuzie, Display, TEXT("Processing JSON class definition: %s"), *JsonFileName);
     
         // Read the JSON file
@@ -93,7 +102,9 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
     for (const FString& CompressedJsonFileName : CompressedJsonFileNames)
     {
         GenerateDynamicClassesTask.EnterProgressFrame(1, FText::Format(LOCTEXT("ProcessingJsonFile", "Generating classes for file {0}"), FText::AsCultureInvariant(CompressedJsonFileName)));
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3    
         GenerateDynamicClassesTask.ForceRefresh();
+#endif
         UE_LOG(LogSuzie, Display, TEXT("Processing compressed JSON class definition: %s"), *CompressedJsonFileName);
 
         // Read binary file contents
@@ -879,7 +890,6 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         {TEXT("CPF_DisableEditOnTemplate"), CPF_DisableEditOnTemplate},
         {TEXT("CPF_NonNullable"), CPF_NonNullable},
         {TEXT("CPF_Transient"), CPF_Transient},
-        {TEXT("CPF_RequiredParm"), CPF_RequiredParm},
         {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
         {TEXT("CPF_EditConst"), CPF_EditConst},
         {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
@@ -916,10 +926,13 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         {TEXT("CPF_NativeAccessSpecifierProtected"), CPF_NativeAccessSpecifierProtected},
         {TEXT("CPF_NativeAccessSpecifierPrivate"), CPF_NativeAccessSpecifierPrivate},
         {TEXT("CPF_SkipSerialization"), CPF_SkipSerialization},
-        {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
 #if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
         // Added in 5.5, allows references to the current object from within the property
         {TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference},
+#endif
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+        {TEXT("CPF_RequiredParm"), CPF_RequiredParm},
+        {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
 #endif
         // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
         {TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash},
@@ -1024,16 +1037,18 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     else
     {
         // TODO: These can be handled together without special casing them by dumping array of FField::GetInnerFields instead of individual fields
-        if (FOptionalProperty* OptionalProperty = CastField<FOptionalProperty>(NewProperty))
-        {
-            FProperty* ValueProperty = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("inner")));
-            OptionalProperty->AddCppProperty(ValueProperty);
-        }
-        else if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(NewProperty))
+        if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(NewProperty))
         {
             FProperty* Inner = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("inner")));
             ArrayProperty->AddCppProperty(Inner);
         }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+        else if (FOptionalProperty* OptionalProperty = CastField<FOptionalProperty>(NewProperty))
+        {
+            FProperty* ValueProperty = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("inner")));
+            OptionalProperty->AddCppProperty(ValueProperty);
+        }
+#endif
         else if (FSetProperty* SetProperty = CastField<FSetProperty>(NewProperty))
         {
             FProperty* KeyProp = BuildProperty(Context, NewProperty, PropertyJson->GetObjectField(TEXT("key_prop")));
@@ -1207,6 +1222,7 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
         const TFieldPath<FProperty> FieldPath(*JsonPropertyValue->AsString());
         FieldPathProperty->SetPropertyValue(PropertyValuePtr, FieldPath);
     }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
     else if (const FOptionalProperty* OptionalProperty = CastField<FOptionalProperty>(Property))
     {
         // If JSON property value is null, optional property is unset
@@ -1221,6 +1237,7 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
             DeserializePropertyValue(OptionalProperty->GetValueProperty(), ValuePropertyValuePtr, JsonPropertyValue);
         }
     }
+#endif
     else if (const FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
     {
         const TArray<TSharedPtr<FJsonValue>>& ArrayElementJsonValues = JsonPropertyValue->AsArray();
@@ -1229,7 +1246,9 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
         ArrayValueHelper.Resize(ArrayElementJsonValues.Num());
         for (int32 ElementIndex = 0; ElementIndex < ArrayElementJsonValues.Num(); ElementIndex++)
         {
-            void* ElementValuePtr = ArrayValueHelper.GetElementPtr(ElementIndex);
+            // GetElementPtr does not exist in <5.3 and this one will inline
+            // If inlining is undesirable, wrapper or ifdef can be used
+            void* ElementValuePtr = ArrayValueHelper.GetRawPtr(ElementIndex);
             DeserializePropertyValue(ArrayProperty->Inner, ElementValuePtr, ArrayElementJsonValues[ElementIndex]);
         }
     }
