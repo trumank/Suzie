@@ -54,10 +54,10 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
     
     // Find all JSON files and compressed JSON files
     TArray<FString> JsonFileNames;
-    IFileManager::Get().FindFiles(JsonFileNames, *JsonClassesPath, TEXT("*.json"));
+    IFileManager::Get().FindFiles(JsonFileNames, *JsonClassesPath, TEXT("*.jmap"));
 
     TArray<FString> CompressedJsonFileNames;
-    IFileManager::Get().FindFiles(CompressedJsonFileNames, *JsonClassesPath, TEXT("*.json.gz"));
+    IFileManager::Get().FindFiles(CompressedJsonFileNames, *JsonClassesPath, TEXT("*.jmap.gz"));
     
     UE_LOG(LogSuzie, Display, TEXT("Found %d JSON class definition files"), JsonFileNames.Num() + CompressedJsonFileNames.Num());
 

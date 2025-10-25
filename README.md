@@ -4,11 +4,11 @@ Suzie is an Unreal Engine plugin that dynamically generates UHT (Unreal Header T
 
 ## How It Works
 
-Suzie works in conjunction with [meatloaf](https://github.com/trumank/meatloaf), a tool that dumps class information from running Unreal Engine games. The workflow is:
+Suzie works in conjunction with [jmap_dumper](https://github.com/trumank/jmap), a tool that dumps class information from running Unreal Engine games. The workflow is:
 
-1. Use meatloaf to dump class definitions from a running game into a JSON file
-2. Place the JSON file in project's `Content/DynamicClasses` directory
-3. Suzie reads this JSON file and generates all necessary classes at editor startup and during cooking
+1. Use jmap_dumper to dump class definitions from a running game into a .jmap (JSON) file
+2. Place the .jmap file in project's `Content/DynamicClasses` directory
+3. Suzie reads this file and generates all necessary classes at editor startup and during cooking
 4. All native game classes become available in the Blueprint editor
 
 ## Supported Engine Versions
@@ -19,7 +19,7 @@ Suzie has been tested on Unreal Engine 5.3 through 5.6. Other versions may requi
 
 ### Step 1: Obtain Game Dump
 
-Use [meatloaf](https://github.com/trumank/meatloaf) to dump class definitions from target game into a `.json.gz` (or plain `.json`) file.
+Use [jmap_dumper](https://github.com/trumank/jmap) to dump class definitions from target game into a `.jmap.gz` (or plain `.jmap`) file.
 
 ### Step 2: Set Up Unreal Project
 
@@ -32,9 +32,9 @@ Use [meatloaf](https://github.com/trumank/meatloaf) to dump class definitions fr
 mkdir -p YourProject/Content/DynamicClasses
 ```
 
-3. Copy the dumped JSON file:
+3. Copy the dumped .jmap file:
 ```bash
-cp output.json.gz YourProject/Content/DynamicClasses/
+cp output.jmap.gz YourProject/Content/DynamicClasses/
 ```
 
 ### Step 3: Install Suzie Plugin
