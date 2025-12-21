@@ -1354,7 +1354,17 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
     const FDynamicClassConstructionData* TopLevelClassConstructionData = DynamicClassConstructionData.Find(TopLevelDynamicClass);
     checkf(TopLevelClassConstructionData, TEXT("Failed to find dynamic class construction data for dynamic class %s"), *TopLevelDynamicClass->GetPathName());
 
-    // Run logic necessary for the top level dynamic class object. That includes setting up defautl subobject overrides and the active archetype to use for property copying
+    // Gather all dynamic classes that contribute to the object being constructed, starting at the top level one
+    // We need this list BEFORE applying subobject overrides to handle the entire hierarchy
+    TArray<const UClass*, TInlineAllocator<8>> DynamicClassHierarchyTree;
+    const UClass* CurrentDynamicClass = TopLevelDynamicClass;
+    while (CurrentDynamicClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
+    {
+        DynamicClassHierarchyTree.Add(CurrentDynamicClass);
+        CurrentDynamicClass = CurrentDynamicClass->GetSuperClass();
+    }
+
+    // Run logic necessary for the top level dynamic class object. That includes setting up default subobject overrides and the active archetype to use for property copying
     {
         // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
         // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
@@ -1365,40 +1375,59 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
             ObjectInitializerAccess->ObjectArchetype = TopLevelClassConstructionData->DefaultObjectArchetype;
             ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
         }
-        
-        // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
-        for (const FDynamicObjectConstructionData& SubobjectConstructionData : TopLevelClassConstructionData->DefaultSubobjects)
+
+        // Collect subobject overrides from the ENTIRE dynamic class hierarchy, not just the top-level class.
+        // Child class overrides take precedence over parent class definitions, so we iterate from parent to child
+        // and let later entries overwrite earlier ones.
+        TMap<FName, UClass*> FinalSubobjectClasses;
+        TSet<FName> AllSuppressedSubobjects;
+        TArray<FNestedDefaultSubobjectOverrideData> AllNestedOverrides;
+
+        // Iterate from furthest parent to top-level class (reverse order)
+        for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
+        {
+            const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(DynamicClassHierarchyTree[i]);
+            if (ClassConstructionData)
+            {
+                // Collect subobject classes - child overrides parent
+                for (const FDynamicObjectConstructionData& SubobjectData : ClassConstructionData->DefaultSubobjects)
+                {
+                    FinalSubobjectClasses.Add(SubobjectData.ObjectName, SubobjectData.ObjectClass);
+                }
+                // Collect suppressed subobjects
+                for (const FName& SuppressedName : ClassConstructionData->SuppressedDefaultSubobjects)
+                {
+                    AllSuppressedSubobjects.Add(SuppressedName);
+                }
+                // Collect nested overrides
+                AllNestedOverrides.Append(ClassConstructionData->DefaultSubobjectOverrides);
+            }
+        }
+
+        // Apply all subobject class overrides before running any constructor
+        for (const auto& [SubobjectName, SubobjectClass] : FinalSubobjectClasses)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
-            ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
+            ObjectInitializer.SetDefaultSubobjectClass(SubobjectName, SubobjectClass);
         }
-        // Disable creation of certain subobjects that this class does not want to have
-        for (const FName& DisabledSubobjectName : TopLevelClassConstructionData->SuppressedDefaultSubobjects)
+
+        // Disable creation of certain subobjects that any class in the hierarchy does not want to have
+        for (const FName& DisabledSubobjectName : AllSuppressedSubobjects)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
             ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
         }
-        
-        // Also apply overrides for nested subobject types. These are very rare but should be handled regardless
-        // TODO: We do not handle disabled nested default subobjects currently. Case is extremely rare and nested subobjects are extremely rare themselves, so this can be revised later
-        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : TopLevelClassConstructionData->DefaultSubobjectOverrides)
+
+        // Apply overrides for nested subobject types
+        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : AllNestedOverrides)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
             ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
         }
     }
-    
+
     // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
     NativeParentClass->ClassConstructor(ObjectInitializer);
-
-    // Gather all dynamic classes that contribute to the object being constructed, starting at the top level one
-    TArray<const UClass*, TInlineAllocator<8>> DynamicClassHierarchyTree;
-    const UClass* CurrentDynamicClass = TopLevelDynamicClass;
-    while (CurrentDynamicClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
-    {
-        DynamicClassHierarchyTree.Add(CurrentDynamicClass);
-        CurrentDynamicClass = CurrentDynamicClass->GetSuperClass();
-    }
 
     // Run constructors for each dynamic class in reverse order, e.g. from the furthest parent to the top level class
     for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
@@ -1418,11 +1447,15 @@ void FSuziePluginModule::ExecutePolymorphicClassConstructorFrameForDynamicClass(
     {
         Property->InitializeValue_InContainer(ObjectInitializer.GetObj());
     }
-    
+
     // Create missing default subobjects for this dynamic class type
+    // NOTE: We check by NAME only (using UObject::StaticClass()), not by specific class type.
+    // This is because a child class in the hierarchy may have overridden the subobject's class type,
+    // and the subobject will have been created with the overridden type (via SetDefaultSubobjectClass).
+    // If we checked by the original class type, we wouldn't find it and would try to create a duplicate.
     for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
     {
-        if (StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
+        if (StaticFindObjectFast(UObject::StaticClass(), ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
         {
             ObjectInitializer.CreateDefaultSubobject(ObjectInitializer.GetObj(),
                 SubobjectConstructionData.ObjectName, UObject::StaticClass(), SubobjectConstructionData.ObjectClass,
