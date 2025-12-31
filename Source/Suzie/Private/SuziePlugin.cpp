@@ -734,8 +734,23 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         }
     }
 
+    // Determine the specific function class to instantiate (UFunction, UDelegateFunction, or USparseDelegateFunction)
+    FString FunctionClassPath;
+    FunctionDefinition->TryGetStringField(TEXT("class"), FunctionClassPath);
+    UClass* FunctionClass = UFunction::StaticClass();
+
+    if (FunctionClassPath.Contains(TEXT("SparseDelegateFunction")))
+    {
+        FunctionClass = USparseDelegateFunction::StaticClass();
+    }
+    else if (FunctionClassPath.Contains(TEXT("DelegateFunction")))
+    {
+        FunctionClass = UDelegateFunction::StaticClass();
+    }
+
     // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
-    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
+    // Use the determined FunctionClass instead of the template parameter
+    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, FunctionClass, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
     NewFunction->ClearFlags(RF_ArchetypeObject);
     NewFunction->FunctionFlags |= FunctionFlags;
 
@@ -1018,6 +1033,12 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
         // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
         DelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
+    }
+    else if (FMulticastSparseDelegateProperty* SparseDelegateProperty = CastField<FMulticastSparseDelegateProperty>(NewProperty))
+    {
+        UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
+        SparseDelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
     }
     else if (FMulticastDelegateProperty* MulticastDelegateProperty = CastField<FMulticastDelegateProperty>(NewProperty))
     {
