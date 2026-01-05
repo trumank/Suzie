@@ -5,11 +5,16 @@
 #include "Engine/Blueprint.h"
 #include "UObject/Class.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/UObjectAllocator.h"
 #include "UObject/Package.h"
 #include "UObject/ObjectMacros.h"
 #include "UObject/UnrealType.h"
 #include "UObject/PropertyPortFlags.h"
+#if ENGINE_MAJOR_VERSION >= 5
 #include "HAL/PlatformFileManager.h"
+#else
+#include "HAL/PlatformFilemanager.h"
+#endif
 #include "Editor/EditorEngine.h"
 #include "Framework/Commands/UICommandList.h"
 #include "Engine/EngineTypes.h"
@@ -157,6 +162,17 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     {
         FString ObjectPath = It.Key();
         FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
+
+#if ENGINE_MAJOR_VERSION < 5
+        // UE4: Skip problematic modules that cause crashes in Content Browser's native class hierarchy
+        if (ObjectPath.StartsWith(TEXT("/Script/ControlRig.")) ||
+            ObjectPath.StartsWith(TEXT("/Script/ScriptPlugin.")))
+        {
+            UE_LOG(LogSuzie, Verbose, TEXT("Skipping problematic object in UE4: %s"), *ObjectPath);
+            continue;
+        }
+#endif
+
         if (Type == TEXT("Class"))
         {
             // Meatloaf bug (commit d8179e8): CDOs of UClass-derived native classes will be labeled with Class type, instead of "Object" type, which will result in a crash
@@ -189,7 +205,7 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     }
 
     // Construct classes that have been created but have not been constructed yet due to nobody referencing them
-    while (!ClassGenerationContext.ClassesPendingConstruction.IsEmpty())
+    while (ClassGenerationContext.ClassesPendingConstruction.Num() > 0)
     {
         TArray<FString> ClassPathsPendingConstruction;
         ClassGenerationContext.ClassesPendingConstruction.GenerateValueArray(ClassPathsPendingConstruction);
@@ -221,6 +237,7 @@ UPackage* FSuziePluginModule::FindOrCreatePackage(FDynamicClassGenerationContext
 
 UClass* FSuziePluginModule::GetPlaceholderNonNativePropertyOwnerClass()
 {
+#if ENGINE_MAJOR_VERSION >= 5
     static UBlueprintGeneratedClass* PlaceholderNonNativeOwnerClass = nullptr;
     if (PlaceholderNonNativeOwnerClass == nullptr)
     {
@@ -231,6 +248,22 @@ UClass* FSuziePluginModule::GetPlaceholderNonNativePropertyOwnerClass()
         PlaceholderNonNativeOwnerClass->Bind();
         PlaceholderNonNativeOwnerClass->StaticLink(true);
     }
+#else
+    // UE4: Use regular UClass instead of UBlueprintGeneratedClass to avoid ClassGeneratedBy requirement
+    static UClass* PlaceholderNonNativeOwnerClass = nullptr;
+    if (PlaceholderNonNativeOwnerClass == nullptr)
+    {
+        PlaceholderNonNativeOwnerClass = NewObject<UClass>(GetTransientPackage(), TEXT("SuziePlaceholderClass"), RF_Public | RF_Transient | RF_MarkAsRootSet);
+        PlaceholderNonNativeOwnerClass->SetSuperStruct(UObject::StaticClass());
+        PlaceholderNonNativeOwnerClass->ClassFlags = CLASS_Abstract | CLASS_Hidden | CLASS_Transient;
+        PlaceholderNonNativeOwnerClass->ClassWithin = UObject::StaticClass();
+        PlaceholderNonNativeOwnerClass->ClassConstructor = UObject::StaticClass()->ClassConstructor;
+        PlaceholderNonNativeOwnerClass->ClassAddReferencedObjects = &UObject::AddReferencedObjects;
+
+        PlaceholderNonNativeOwnerClass->Bind();
+        PlaceholderNonNativeOwnerClass->StaticLink(true);
+    }
+#endif
     return PlaceholderNonNativeOwnerClass;
 }
 
@@ -273,34 +306,35 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     FindOrCreatePackage(Context, PackageName);
 
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EClassFlags>> ClassFlagNameLookup = {
-        {TEXT("CLASS_Abstract"), CLASS_Abstract},
-        {TEXT("CLASS_EditInlineNew"), CLASS_EditInlineNew},
-        {TEXT("CLASS_NotPlaceable"), CLASS_NotPlaceable},
-        {TEXT("CLASS_CollapseCategories"), CLASS_CollapseCategories},
-        {TEXT("CLASS_Const"), CLASS_Const},
-        {TEXT("CLASS_DefaultToInstanced"), CLASS_DefaultToInstanced},
-        {TEXT("CLASS_Interface"), CLASS_Interface},
+    static const TPair<FString, EClassFlags> ClassFlagNameLookupData[] = {
+        TPair<FString, EClassFlags>(TEXT("CLASS_Abstract"), CLASS_Abstract),
+        TPair<FString, EClassFlags>(TEXT("CLASS_EditInlineNew"), CLASS_EditInlineNew),
+        TPair<FString, EClassFlags>(TEXT("CLASS_NotPlaceable"), CLASS_NotPlaceable),
+        TPair<FString, EClassFlags>(TEXT("CLASS_CollapseCategories"), CLASS_CollapseCategories),
+        TPair<FString, EClassFlags>(TEXT("CLASS_Const"), CLASS_Const),
+        TPair<FString, EClassFlags>(TEXT("CLASS_DefaultToInstanced"), CLASS_DefaultToInstanced),
+        TPair<FString, EClassFlags>(TEXT("CLASS_Interface"), CLASS_Interface),
     };
+    static const TArray<TPair<FString, EClassFlags>> ClassFlagNameLookup(ClassFlagNameLookupData, UE_ARRAY_COUNT(ClassFlagNameLookupData));
 
     // Convert class flag names to the class flags bitmask
     EClassFlags ClassFlags = CLASS_Native | CLASS_Intrinsic;
     const TSet<FString> ClassFlagNames = ParseFlags(ClassDefinition->GetStringField(TEXT("class_flags")));
-    for (const auto& [ClassFlagName, ClassFlagBit] : ClassFlagNameLookup)
+    for (const TPair<FString, EClassFlags>& FlagPair : ClassFlagNameLookup)
     {
-        if (ClassFlagNames.Contains(ClassFlagName))
+        if (ClassFlagNames.Contains(FlagPair.Key))
         {
-            ClassFlags |= ClassFlagBit;
+            ClassFlags |= FlagPair.Value;
         }
     }
-    
-    // UE does not provide a copy constructor for that type, but it is a very much memcpy-able POD type
-    FUObjectCppClassStaticFunctions ClassStaticFunctions;
-    memcpy(&ClassStaticFunctions, &ParentClass->CppClassStaticFunctions, sizeof(ClassStaticFunctions));
     
     //Code below is taken from GetPrivateStaticClassBody
     //Allocate memory from ObjectAllocator for class object and call class constructor directly
     UClass* ConstructedClassObject = static_cast<UClass*>(GUObjectAllocator.AllocateUObject(sizeof(UClass), alignof(UClass), true));
+#if ENGINE_MAJOR_VERSION >= 5
+    // UE does not provide a copy constructor for that type, but it is a very much memcpy-able POD type
+    FUObjectCppClassStaticFunctions ClassStaticFunctions;
+    memcpy(&ClassStaticFunctions, &ParentClass->CppClassStaticFunctions, sizeof(ClassStaticFunctions));
     ::new (ConstructedClassObject)UClass(
         EC_StaticConstructor,
         *ClassName,
@@ -313,6 +347,20 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper,
         ParentClass->ClassVTableHelperCtorCaller,
         MoveTemp(ClassStaticFunctions));
+#else
+    ::new (ConstructedClassObject)UClass(
+        EC_StaticConstructor,
+        *ClassName,
+        ParentClass->GetStructureSize(),
+        ParentClass->GetMinAlignment(),
+        ClassFlags,
+        CASTCLASS_None,
+        UObject::StaticConfigName(),
+        RF_Public | RF_MarkAsNative | RF_MarkAsRootSet,
+        &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper,
+        ParentClass->ClassVTableHelperCtorCaller,
+        ParentClass->ClassAddReferencedObjects);
+#endif
 
     //Set super structure and ClassWithin (they are required prior to registering)
     ConstructedClassObject->SetSuperStruct(ParentClass);
@@ -485,7 +533,7 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     NewClass->SetSparseClassDataStruct(NewClass->GetSparseClassDataArchetypeStruct());
 
     // If we have properties that need destructor call, we add a synthetic property of custom type to DestructorLink
-    if (!PropertiesWithDestructor.IsEmpty())
+    if (PropertiesWithDestructor.Num() > 0)
     {
         FProperty* DestructorCallProperty = new FDynamicClassDestructorCallProperty(NewClass, PropertiesWithDestructor);
         DestructorCallProperty->DestructorLinkNext = NewClass->DestructorLink;
@@ -548,18 +596,19 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     }
 
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EStructFlags>> StructFlagNameLookup = {
-        {TEXT("STRUCT_Atomic"), STRUCT_Atomic},
-        {TEXT("STRUCT_Immutable"), STRUCT_Immutable},
+    static const TPair<FString, EStructFlags> StructFlagNameLookupData[] = {
+        TPair<FString, EStructFlags>(TEXT("STRUCT_Atomic"), STRUCT_Atomic),
+        TPair<FString, EStructFlags>(TEXT("STRUCT_Immutable"), STRUCT_Immutable),
     };
+    static const TArray<TPair<FString, EStructFlags>> StructFlagNameLookup(StructFlagNameLookupData, UE_ARRAY_COUNT(StructFlagNameLookupData));
 
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> StructFlagNames = ParseFlags(StructDefinition->GetStringField(TEXT("struct_flags")));
-    for (const auto& [StructFlagName, StructFlagBit] : StructFlagNameLookup)
+    for (const TPair<FString, EStructFlags>& FlagPair : StructFlagNameLookup)
     {
-        if (StructFlagNames.Contains(StructFlagName))
+        if (StructFlagNames.Contains(FlagPair.Key))
         {
-            NewStruct->StructFlags = (EStructFlags)((int32)NewStruct->StructFlags | StructFlagBit);
+            NewStruct->StructFlags = (EStructFlags)((int32)NewStruct->StructFlags | FlagPair.Value);
         }
     }
 
@@ -633,7 +682,7 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
             // TODO: Using numbers to represent enumeration values is not safe, large int64 values cannot be adequately represented as json double precision numbers
             const int64 EnumConstantValue = EnumNameAndValueArray[1]->AsNumber();
 
-            EnumNames.Add({FName(*EnumConstantName), EnumConstantValue});
+            EnumNames.Add(TPair<FName, int64>(FName(*EnumConstantName), EnumConstantValue));
             bContainsFullyQualifiedNames |= EnumConstantName.Contains(TEXT("::"));
         }
     }
@@ -687,35 +736,36 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     }
 
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EFunctionFlags>> FunctionFlagNameLookup = {
-        {TEXT("FUNC_Final"), FUNC_Final},
-        {TEXT("FUNC_BlueprintAuthorityOnly"), FUNC_BlueprintAuthorityOnly},
-        {TEXT("FUNC_BlueprintCosmetic"), FUNC_BlueprintCosmetic},
-        {TEXT("FUNC_Net"), FUNC_Net},
-        {TEXT("FUNC_NetReliable"), FUNC_NetReliable},
-        {TEXT("FUNC_NetRequest"), FUNC_NetRequest},
-        {TEXT("FUNC_Exec"), FUNC_Exec},
-        {TEXT("FUNC_Event"), FUNC_Event},
-        {TEXT("FUNC_NetResponse"), FUNC_NetResponse},
-        {TEXT("FUNC_Static"), FUNC_Static},
-        {TEXT("FUNC_NetMulticast"), FUNC_NetMulticast},
-        {TEXT("FUNC_UbergraphFunction"), FUNC_UbergraphFunction},
-        {TEXT("FUNC_MulticastDelegate"), FUNC_MulticastDelegate},
-        {TEXT("FUNC_Public"), FUNC_Public},
-        {TEXT("FUNC_Private"), FUNC_Private},
-        {TEXT("FUNC_Protected"), FUNC_Protected},
-        {TEXT("FUNC_Delegate"), FUNC_Delegate},
-        {TEXT("FUNC_NetServer"), FUNC_NetServer},
-        {TEXT("FUNC_NetClient"), FUNC_NetClient},
-        {TEXT("FUNC_BlueprintCallable"), FUNC_BlueprintCallable},
-        {TEXT("FUNC_BlueprintEvent"), FUNC_BlueprintEvent},
-        {TEXT("FUNC_BlueprintPure"), FUNC_BlueprintPure},
-        {TEXT("FUNC_EditorOnly"), FUNC_EditorOnly},
-        {TEXT("FUNC_Const"), FUNC_Const},
-        {TEXT("FUNC_NetValidate"), FUNC_NetValidate},
-        {TEXT("FUNC_HasOutParms"), FUNC_HasOutParms},
-        {TEXT("FUNC_HasDefaults"), FUNC_HasDefaults},
+    static const TPair<FString, EFunctionFlags> FunctionFlagNameLookupData[] = {
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Final"), FUNC_Final),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_BlueprintAuthorityOnly"), FUNC_BlueprintAuthorityOnly),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_BlueprintCosmetic"), FUNC_BlueprintCosmetic),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Net"), FUNC_Net),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetReliable"), FUNC_NetReliable),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetRequest"), FUNC_NetRequest),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Exec"), FUNC_Exec),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Event"), FUNC_Event),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetResponse"), FUNC_NetResponse),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Static"), FUNC_Static),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetMulticast"), FUNC_NetMulticast),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_UbergraphFunction"), FUNC_UbergraphFunction),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_MulticastDelegate"), FUNC_MulticastDelegate),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Public"), FUNC_Public),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Private"), FUNC_Private),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Protected"), FUNC_Protected),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Delegate"), FUNC_Delegate),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetServer"), FUNC_NetServer),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetClient"), FUNC_NetClient),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_BlueprintCallable"), FUNC_BlueprintCallable),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_BlueprintEvent"), FUNC_BlueprintEvent),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_BlueprintPure"), FUNC_BlueprintPure),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_EditorOnly"), FUNC_EditorOnly),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_Const"), FUNC_Const),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_NetValidate"), FUNC_NetValidate),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_HasOutParms"), FUNC_HasOutParms),
+        TPair<FString, EFunctionFlags>(TEXT("FUNC_HasDefaults"), FUNC_HasDefaults),
     };
+    static const TArray<TPair<FString, EFunctionFlags>> FunctionFlagNameLookup(FunctionFlagNameLookupData, UE_ARRAY_COUNT(FunctionFlagNameLookupData));
 
     const TSharedPtr<FJsonObject> FunctionDefinition = Context.GlobalObjectMap->GetObjectField(FunctionPath);
     checkf(FunctionDefinition.IsValid(), TEXT("Failed to find function object by path %s"), *FunctionPath);
@@ -726,18 +776,33 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> FunctionFlagNames = ParseFlags(FunctionDefinition->GetStringField(TEXT("function_flags")));
     EFunctionFlags FunctionFlags = FUNC_None;
-    for (const auto& [FunctionFlagName, FunctionFlagBit] : FunctionFlagNameLookup)
+    for (const TPair<FString, EFunctionFlags>& FlagPair : FunctionFlagNameLookup)
     {
-        if (FunctionFlagNames.Contains(FunctionFlagName))
+        if (FunctionFlagNames.Contains(FlagPair.Key))
         {
-            FunctionFlags |= FunctionFlagBit;
+            FunctionFlags |= FlagPair.Value;
         }
     }
 
-    // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
-    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
-    NewFunction->ClearFlags(RF_ArchetypeObject);
-    NewFunction->FunctionFlags |= FunctionFlags;
+    // Create the function - use UDelegateFunction with internal constructor for delegate signatures to allow package as outer
+    UFunction* NewFunction;
+    const bool bIsDelegateSignature = (FunctionFlags & (FUNC_Delegate | FUNC_MulticastDelegate)) != 0;
+    if (bIsDelegateSignature)
+    {
+        // Use the internal constructor that native code uses - this allows UPackage as outer for delegate signatures
+        NewFunction = new (EC_InternalUseOnlyConstructor, FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet) UDelegateFunction(
+            FObjectInitializer(),
+            nullptr, // Super
+            FunctionFlags
+        );
+    }
+    else
+    {
+        // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
+        NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
+        NewFunction->ClearFlags(RF_ArchetypeObject);
+        NewFunction->FunctionFlags |= FunctionFlags;
+    }
 
     // Since this function is not marked as Native, we have to initialize Script bytecode for it
     // Most basic valid kismet bytecode for a function would be EX_Return EX_Nothing EX_EndOfScript, so generate that
@@ -769,7 +834,8 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
             NewFunction->SetMetaData(FBlueprintMetadata::MD_WorldContext, *Property->GetName());
         }
         // Latent Info struct parameter properties should always be tagged as LatentInfo and indicate async BP functions
-        if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct == FLatentActionInfo::StaticStruct())
+        const FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+        if (StructProperty && StructProperty->Struct == FLatentActionInfo::StaticStruct())
         {
             NewFunction->SetMetaData(FBlueprintMetadata::MD_LatentInfo, *Property->GetName());
             NewFunction->SetMetaData(FBlueprintMetadata::MD_Latent, TEXT("true"));
@@ -873,80 +939,90 @@ void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Cont
     }
 }
 
+static TArray<TPair<FString, EPropertyFlags>> BuildPropertyFlagNameLookup()
+{
+    TArray<TPair<FString, EPropertyFlags>> Result;
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Edit"), CPF_Edit));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_ConstParm"), CPF_ConstParm));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_BlueprintVisible"), CPF_BlueprintVisible));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_ExportObject"), CPF_ExportObject));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_BlueprintReadOnly"), CPF_BlueprintReadOnly));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Net"), CPF_Net));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_EditFixedSize"), CPF_EditFixedSize));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Parm"), CPF_Parm));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_OutParm"), CPF_OutParm));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_ReturnParm"), CPF_ReturnParm));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_DisableEditOnTemplate"), CPF_DisableEditOnTemplate));
+#if ENGINE_MAJOR_VERSION >= 5
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NonNullable"), CPF_NonNullable));
+#endif
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Transient"), CPF_Transient));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_EditConst"), CPF_EditConst));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_InstancedReference"), CPF_InstancedReference));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_DuplicateTransient"), CPF_DuplicateTransient));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_SaveGame"), CPF_SaveGame));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NoClear"), CPF_NoClear));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_ReferenceParm"), CPF_ReferenceParm));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_BlueprintAssignable"), CPF_BlueprintAssignable));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Deprecated"), CPF_Deprecated));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_RepSkip"), CPF_RepSkip));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_RepNotify"), CPF_RepNotify));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Interp"), CPF_Interp));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NonTransactional"), CPF_NonTransactional));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_EditorOnly"), CPF_EditorOnly));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_AutoWeak"), CPF_AutoWeak));
+    // CPF_ContainsInstancedReference is actually computed, but it is set by the compiler and not in runtime,
+    // so we need to either carry it over (like we do here), or manually set it on container properties when their
+    // elements have CPF_ContainsInstancedReference
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_ContainsInstancedReference"), CPF_ContainsInstancedReference));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_AssetRegistrySearchable"), CPF_AssetRegistrySearchable));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_SimpleDisplay"), CPF_SimpleDisplay));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_AdvancedDisplay"), CPF_AdvancedDisplay));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_Protected"), CPF_Protected));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_BlueprintCallable"), CPF_BlueprintCallable));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_BlueprintAuthorityOnly"), CPF_BlueprintAuthorityOnly));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_TextExportTransient"), CPF_TextExportTransient));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NonPIEDuplicateTransient"), CPF_NonPIEDuplicateTransient));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_PersistentInstance"), CPF_PersistentInstance));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_UObjectWrapper"), CPF_UObjectWrapper));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NativeAccessSpecifierPublic"), CPF_NativeAccessSpecifierPublic));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NativeAccessSpecifierProtected"), CPF_NativeAccessSpecifierProtected));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_NativeAccessSpecifierPrivate"), CPF_NativeAccessSpecifierPrivate));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_SkipSerialization"), CPF_SkipSerialization));
+#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
+    // Added in 5.5, allows references to the current object from within the property
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference));
+#endif
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_RequiredParm"), CPF_RequiredParm));
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_TObjectPtr"), CPF_TObjectPtr));
+#endif
+    // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
+    Result.Add(TPair<FString, EPropertyFlags>(TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash));
+    return Result;
+}
+
 FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags)
 {
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EPropertyFlags>> PropertyFlagNameLookup = {
-        {TEXT("CPF_Edit"), CPF_Edit},
-        {TEXT("CPF_ConstParm"), CPF_ConstParm},
-        {TEXT("CPF_BlueprintVisible"), CPF_BlueprintVisible},
-        {TEXT("CPF_ExportObject"), CPF_ExportObject},
-        {TEXT("CPF_BlueprintReadOnly"), CPF_BlueprintReadOnly},
-        {TEXT("CPF_Net"), CPF_Net},
-        {TEXT("CPF_EditFixedSize"), CPF_EditFixedSize},
-        {TEXT("CPF_Parm"), CPF_Parm},
-        {TEXT("CPF_OutParm"), CPF_OutParm},
-        {TEXT("CPF_ReturnParm"), CPF_ReturnParm},
-        {TEXT("CPF_DisableEditOnTemplate"), CPF_DisableEditOnTemplate},
-        {TEXT("CPF_NonNullable"), CPF_NonNullable},
-        {TEXT("CPF_Transient"), CPF_Transient},
-        {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
-        {TEXT("CPF_EditConst"), CPF_EditConst},
-        {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
-        {TEXT("CPF_InstancedReference"), CPF_InstancedReference},
-        {TEXT("CPF_DuplicateTransient"), CPF_DuplicateTransient},
-        {TEXT("CPF_SaveGame"), CPF_SaveGame},
-        {TEXT("CPF_NoClear"), CPF_NoClear},
-        {TEXT("CPF_SaveGame"), CPF_SaveGame},
-        {TEXT("CPF_ReferenceParm"), CPF_ReferenceParm},
-        {TEXT("CPF_BlueprintAssignable"), CPF_BlueprintAssignable},
-        {TEXT("CPF_Deprecated"), CPF_Deprecated},
-        {TEXT("CPF_RepSkip"), CPF_RepSkip},
-        {TEXT("CPF_Deprecated"), CPF_Deprecated},
-        {TEXT("CPF_RepNotify"), CPF_RepNotify},
-        {TEXT("CPF_Interp"), CPF_Interp},
-        {TEXT("CPF_NonTransactional"), CPF_NonTransactional},
-        {TEXT("CPF_EditorOnly"), CPF_EditorOnly},
-        {TEXT("CPF_AutoWeak"), CPF_AutoWeak},
-        // CPF_ContainsInstancedReference is actually computed, but it is set by the compiler and not in runtime,
-        // so we need to either carry it over (like we do here), or manually set it on container properties when their
-        // elements have CPF_ContainsInstancedReference
-        {TEXT("CPF_ContainsInstancedReference"), CPF_ContainsInstancedReference},
-        {TEXT("CPF_AssetRegistrySearchable"), CPF_AssetRegistrySearchable},
-        {TEXT("CPF_SimpleDisplay"), CPF_SimpleDisplay},
-        {TEXT("CPF_AdvancedDisplay"), CPF_AdvancedDisplay},
-        {TEXT("CPF_Protected"), CPF_Protected},
-        {TEXT("CPF_BlueprintCallable"), CPF_BlueprintCallable},
-        {TEXT("CPF_BlueprintAuthorityOnly"), CPF_BlueprintAuthorityOnly},
-        {TEXT("CPF_TextExportTransient"), CPF_TextExportTransient},
-        {TEXT("CPF_NonPIEDuplicateTransient"), CPF_NonPIEDuplicateTransient},
-        {TEXT("CPF_PersistentInstance"), CPF_PersistentInstance},
-        {TEXT("CPF_UObjectWrapper"), CPF_UObjectWrapper},
-        {TEXT("CPF_NativeAccessSpecifierPublic"), CPF_NativeAccessSpecifierPublic},
-        {TEXT("CPF_NativeAccessSpecifierProtected"), CPF_NativeAccessSpecifierProtected},
-        {TEXT("CPF_NativeAccessSpecifierPrivate"), CPF_NativeAccessSpecifierPrivate},
-        {TEXT("CPF_SkipSerialization"), CPF_SkipSerialization},
-#if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
-        // Added in 5.5, allows references to the current object from within the property
-        {TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference},
-#endif
-#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
-        {TEXT("CPF_RequiredParm"), CPF_RequiredParm},
-        {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
-#endif
-        // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
-        {TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash},
-    };
+    static const TArray<TPair<FString, EPropertyFlags>> PropertyFlagNameLookup = BuildPropertyFlagNameLookup();
 
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> PropertyFlagNames = ParseFlags(PropertyJson->GetStringField(TEXT("flags")));
     EPropertyFlags PropertyFlags = ExtraPropertyFlags;
-    for (const auto& [PropertyFlagName, PropertyFlagBit] : PropertyFlagNameLookup)
+    for (const TPair<FString, EPropertyFlags>& FlagPair : PropertyFlagNameLookup)
     {
-        if (PropertyFlagNames.Contains(PropertyFlagName))
+        if (PropertyFlagNames.Contains(FlagPair.Key))
         {
-            PropertyFlags |= PropertyFlagBit;
+            PropertyFlags |= FlagPair.Value;
         }
+    }
+
+    // If we're adding CPF_BlueprintVisible (making it editable), strip CPF_BlueprintReadOnly so Make struct nodes work
+    if ((ExtraPropertyFlags & CPF_BlueprintVisible) && (PropertyFlags & CPF_BlueprintReadOnly))
+    {
+        PropertyFlags &= ~CPF_BlueprintReadOnly;
     }
 
     const FString PropertyName = PropertyJson->GetStringField(TEXT("name"));
@@ -1088,24 +1164,25 @@ bool FSuziePluginModule::ParseObjectConstructionData(const FDynamicClassGenerati
     }
 
     // Parse object flags. Flags determine how the object should be created
-    static const TArray<TPair<FString, EObjectFlags>> ObjectFlagNameLookup = {
-        {TEXT("RF_Public"), RF_Public},
-        {TEXT("RF_Standalone"), RF_Standalone},
-        {TEXT("RF_Transient"), RF_Transient},
-        {TEXT("RF_Transactional"), RF_Transactional},
-        {TEXT("RF_ArchetypeObject"), RF_ArchetypeObject},
-        {TEXT("RF_ClassDefaultObject"), RF_ClassDefaultObject},
-        {TEXT("RF_DefaultSubObject"), RF_DefaultSubObject},
+    static const TPair<FString, EObjectFlags> ObjectFlagNameLookupData[] = {
+        TPair<FString, EObjectFlags>(TEXT("RF_Public"), RF_Public),
+        TPair<FString, EObjectFlags>(TEXT("RF_Standalone"), RF_Standalone),
+        TPair<FString, EObjectFlags>(TEXT("RF_Transient"), RF_Transient),
+        TPair<FString, EObjectFlags>(TEXT("RF_Transactional"), RF_Transactional),
+        TPair<FString, EObjectFlags>(TEXT("RF_ArchetypeObject"), RF_ArchetypeObject),
+        TPair<FString, EObjectFlags>(TEXT("RF_ClassDefaultObject"), RF_ClassDefaultObject),
+        TPair<FString, EObjectFlags>(TEXT("RF_DefaultSubObject"), RF_DefaultSubObject),
     };
+    static const TArray<TPair<FString, EObjectFlags>> ObjectFlagNameLookup(ObjectFlagNameLookupData, UE_ARRAY_COUNT(ObjectFlagNameLookupData));
 
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> ObjectFlagNames = ParseFlags(ObjectDefinition->GetStringField(TEXT("object_flags")));
     ObjectConstructionData.ObjectFlags = RF_NoFlags;
-    for (const auto& [ObjectFlagName, ObjectFlagBitmask] : ObjectFlagNameLookup)
+    for (const TPair<FString, EObjectFlags>& FlagPair : ObjectFlagNameLookup)
     {
-        if (ObjectFlagNames.Contains(ObjectFlagName))
+        if (ObjectFlagNames.Contains(FlagPair.Key))
         {
-            ObjectConstructionData.ObjectFlags |= ObjectFlagBitmask;
+            ObjectConstructionData.ObjectFlags |= FlagPair.Value;
         }
     }
     return true;
@@ -1148,13 +1225,26 @@ void FSuziePluginModule::DeserializeEnumValue(const FNumericProperty* Underlying
 
 void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, void* PropertyValuePtr, const TSharedPtr<FJsonValue>& JsonPropertyValue)
 {
-    if (const FSoftObjectProperty* SoftObjectProperty = CastField<FSoftObjectProperty>(Property))
+    // Pre-compute all casts to avoid C++17 if-with-initializer syntax
+    const FSoftObjectProperty* SoftObjectProperty = CastField<FSoftObjectProperty>(Property);
+    const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property);
+    const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property);
+    const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property);
+    const FNameProperty* NameProperty = CastField<FNameProperty>(Property);
+    const FStrProperty* StrProperty = CastField<FStrProperty>(Property);
+    const FTextProperty* TextProperty = CastField<FTextProperty>(Property);
+    const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property);
+    const FByteProperty* ByteProperty = CastField<FByteProperty>(Property);
+    const FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+    const FFieldPathProperty* FieldPathProperty = CastField<FFieldPathProperty>(Property);
+
+    if (SoftObjectProperty)
     {
         // We do not actually have to load or look for object pointed by soft object properties, we can just set the value as object path instead
         const FSoftObjectPtr SoftObjectPtr(FSoftObjectPath(JsonPropertyValue->AsString()));
         SoftObjectProperty->SetPropertyValue(PropertyValuePtr, SoftObjectPtr);
     }
-    else if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+    else if (ObjectProperty)
     {
         if (!JsonPropertyValue->IsNull())
         {
@@ -1163,12 +1253,12 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
             ObjectProperty->SetObjectPropertyValue(PropertyValuePtr, Object);
         }
     }
-    else if (const FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property))
+    else if (BoolProperty)
     {
         // Bool properties need special handling because they are represented as JSON booleans
         BoolProperty->SetPropertyValue(PropertyValuePtr, JsonPropertyValue->AsBool());
     }
-    else if (const FNumericProperty* NumericProperty = CastField<FNumericProperty>(Property); NumericProperty && !NumericProperty->IsEnum())
+    else if (NumericProperty && !NumericProperty->IsEnum())
     {
         if (JsonPropertyValue->Type == EJson::Number)
         {
@@ -1190,34 +1280,34 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
             NumericProperty->SetNumericPropertyValueFromString(PropertyValuePtr, *JsonPropertyValue->AsString());
         }
     }
-    else if (const FNameProperty* NameProperty = CastField<FNameProperty>(Property))
+    else if (NameProperty)
     {
         NameProperty->SetPropertyValue(PropertyValuePtr, FName(*JsonPropertyValue->AsString()));
     }
-    else if (const FStrProperty* StrProperty = CastField<FStrProperty>(Property))
+    else if (StrProperty)
     {
         StrProperty->SetPropertyValue(PropertyValuePtr, JsonPropertyValue->AsString());
     }
-    else if (const FTextProperty* TextProperty = CastField<FTextProperty>(Property))
+    else if (TextProperty)
     {
         // TODO: Implement once dump format is known
         TextProperty->SetPropertyValue(PropertyValuePtr, FText::AsCultureInvariant(JsonPropertyValue->AsString()));
     }
-    else if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property); EnumProperty && EnumProperty->GetEnum())
+    else if (EnumProperty && EnumProperty->GetEnum())
     {
         DeserializeEnumValue(EnumProperty->GetUnderlyingProperty(), PropertyValuePtr, EnumProperty->GetEnum(), JsonPropertyValue);
     }
-    else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property); ByteProperty && ByteProperty->Enum)
+    else if (ByteProperty && ByteProperty->Enum)
     {
         // Non enum byte properties are handled above as FNumericProperty case
         DeserializeEnumValue(ByteProperty, PropertyValuePtr, ByteProperty->Enum, JsonPropertyValue);
     }
-    else if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property); StructProperty && StructProperty->Struct)
+    else if (StructProperty && StructProperty->Struct)
     {
         // Deserialize nested struct properties payload
         DeserializeStructProperties(StructProperty->Struct, PropertyValuePtr, JsonPropertyValue->AsObject());
     }
-    else if (const FFieldPathProperty* FieldPathProperty = CastField<FFieldPathProperty>(Property))
+    else if (FieldPathProperty)
     {
         const TFieldPath<FProperty> FieldPath(*JsonPropertyValue->AsString());
         FieldPathProperty->SetPropertyValue(PropertyValuePtr, FieldPath);
@@ -1289,7 +1379,11 @@ void FSuziePluginModule::DeserializePropertyValue(const FProperty* Property, voi
 
 void FSuziePluginModule::DeserializeStructProperties(const UStruct* Struct, void* StructData, const TSharedPtr<FJsonObject>& PropertyValues)
 {
+#if ENGINE_MAJOR_VERSION >= 5
     for (TFieldIterator<FProperty> PropertyIterator(Struct, EFieldIterationFlags::IncludeAll); PropertyIterator; ++PropertyIterator)
+#else
+    for (TFieldIterator<FProperty> PropertyIterator(Struct, EFieldIteratorFlags::IncludeSuper); PropertyIterator; ++PropertyIterator)
+#endif
     {
         const FProperty* Property = *PropertyIterator;
         if (!PropertyValues->HasField(Property->GetName())) continue;
@@ -1405,10 +1499,10 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
         }
 
         // Apply all subobject class overrides before running any constructor
-        for (const auto& [SubobjectName, SubobjectClass] : FinalSubobjectClasses)
+        for (const TPair<FName, UClass*>& SubobjectPair : FinalSubobjectClasses)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
-            ObjectInitializer.SetDefaultSubobjectClass(SubobjectName, SubobjectClass);
+            ObjectInitializer.SetDefaultSubobjectClass(SubobjectPair.Key, SubobjectPair.Value);
         }
 
         // Disable creation of certain subobjects that any class in the hierarchy does not want to have
@@ -1418,12 +1512,16 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
             ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
         }
 
-        // Apply overrides for nested subobject types
+#if ENGINE_MAJOR_VERSION >= 5
+        // Apply overrides for nested subobject types (UE5 only)
         for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : AllNestedOverrides)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
             ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
         }
+#else
+        (void)AllNestedOverrides; // Suppress unused variable warning in UE4
+#endif
     }
 
     // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
