@@ -580,11 +580,16 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     NewStruct->PrepareCppStructOps();
     NewStruct->StaticLink(true);
 
-    // The engine does not gracefully handle empty structs, so force the struct size to be at least one byte
+    // For native structs without reflected properties, use the properties_size from jmap
+    // This is important for structs like GameplayAbilityTargetDataHandle that have no reflected properties but a specific size
+    const int32 JsonPropertiesSize = StructDefinition->GetIntegerField(TEXT("properties_size"));
+    const int32 JsonMinAlignment = StructDefinition->GetIntegerField(TEXT("min_alignment"));
+    
     if (NewStruct->GetPropertiesSize() == 0)
     {
-        NewStruct->MinAlignment = 1;
-        NewStruct->SetPropertiesSize(1);
+        // Use the size from jmap if available, otherwise default to 1 byte
+        const int32 TargetSize = FMath::Max(1, JsonPropertiesSize);
+        const int32 TargetAlignment = FMath::Max(1, JsonMinAlignment);
     }
     
     UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
@@ -849,6 +854,7 @@ FProperty* FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContex
             // This is the first property in the struct, assign it as a head of the linked property list
             Struct->ChildProperties = NewProperty;
         }
+        
         UE_LOG(LogSuzie, VeryVerbose, TEXT("Added property %s to struct %s"), *NewProperty->GetName(), *Struct->GetName());
         return NewProperty;
     }
@@ -974,7 +980,9 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         return nullptr;
     }
     
-    NewProperty->ArrayDim = PropertyJson->GetIntegerField(TEXT("array_dim"));
+    // Ensure ArrayDim is at least 1 to avoid invalid array allocations that could cause overflow errors
+    int32 ArrayDim = PropertyJson->GetIntegerField(TEXT("array_dim"));
+    NewProperty->ArrayDim = FMath::Max(1, ArrayDim);
     NewProperty->PropertyFlags |= PropertyFlags;
 
     if (FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(NewProperty))
