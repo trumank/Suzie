@@ -590,6 +590,8 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
         // Use the size from jmap if available, otherwise default to 1 byte
         const int32 TargetSize = FMath::Max(1, JsonPropertiesSize);
         const int32 TargetAlignment = FMath::Max(1, JsonMinAlignment);
+        NewStruct->MinAlignment = TargetAlignment;
+        NewStruct->SetPropertiesSize(TargetSize);
     }
     
     UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
