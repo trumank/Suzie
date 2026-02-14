@@ -580,11 +580,18 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     NewStruct->PrepareCppStructOps();
     NewStruct->StaticLink(true);
 
-    // The engine does not gracefully handle empty structs, so force the struct size to be at least one byte
+    // For native structs without reflected properties, use the properties_size from jmap
+    // This is important for structs like GameplayAbilityTargetDataHandle that have no reflected properties but a specific size
+    const int32 JsonPropertiesSize = StructDefinition->GetIntegerField(TEXT("properties_size"));
+    const int32 JsonMinAlignment = StructDefinition->GetIntegerField(TEXT("min_alignment"));
+    
     if (NewStruct->GetPropertiesSize() == 0)
     {
-        NewStruct->MinAlignment = 1;
-        NewStruct->SetPropertiesSize(1);
+        // Use the size from jmap if available, otherwise default to 1 byte
+        const int32 TargetSize = FMath::Max(1, JsonPropertiesSize);
+        const int32 TargetAlignment = FMath::Max(1, JsonMinAlignment);
+        NewStruct->MinAlignment = TargetAlignment;
+        NewStruct->SetPropertiesSize(TargetSize);
     }
     
     UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
@@ -734,8 +741,23 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
         }
     }
 
+    // Determine the specific function class to instantiate (UFunction, UDelegateFunction, or USparseDelegateFunction)
+    FString FunctionClassPath;
+    FunctionDefinition->TryGetStringField(TEXT("class"), FunctionClassPath);
+    UClass* FunctionClass = UFunction::StaticClass();
+
+    if (FunctionClassPath.Contains(TEXT("SparseDelegateFunction")))
+    {
+        FunctionClass = USparseDelegateFunction::StaticClass();
+    }
+    else if (FunctionClassPath.Contains(TEXT("DelegateFunction")))
+    {
+        FunctionClass = UDelegateFunction::StaticClass();
+    }
+
     // Have to temporarily mark the function as RF_ArchetypeObject to be able to create functions with UPackage as outer
-    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
+    // Use the determined FunctionClass instead of the template parameter
+    UFunction* NewFunction = NewObject<UFunction>(FunctionOuterObject, FunctionClass, *ObjectName, RF_Public | RF_MarkAsRootSet | RF_ArchetypeObject);
     NewFunction->ClearFlags(RF_ArchetypeObject);
     NewFunction->FunctionFlags |= FunctionFlags;
 
@@ -834,6 +856,7 @@ FProperty* FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContex
             // This is the first property in the struct, assign it as a head of the linked property list
             Struct->ChildProperties = NewProperty;
         }
+        
         UE_LOG(LogSuzie, VeryVerbose, TEXT("Added property %s to struct %s"), *NewProperty->GetName(), *Struct->GetName());
         return NewProperty;
     }
@@ -959,7 +982,9 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         return nullptr;
     }
     
-    NewProperty->ArrayDim = PropertyJson->GetIntegerField(TEXT("array_dim"));
+    // Ensure ArrayDim is at least 1 to avoid invalid array allocations that could cause overflow errors
+    int32 ArrayDim = PropertyJson->GetIntegerField(TEXT("array_dim"));
+    NewProperty->ArrayDim = FMath::Max(1, ArrayDim);
     NewProperty->PropertyFlags |= PropertyFlags;
 
     if (FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(NewProperty))
@@ -1018,6 +1043,12 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
         // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
         DelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
+    }
+    else if (FMulticastSparseDelegateProperty* SparseDelegateProperty = CastField<FMulticastSparseDelegateProperty>(NewProperty))
+    {
+        UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
+        SparseDelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
     }
     else if (FMulticastDelegateProperty* MulticastDelegateProperty = CastField<FMulticastDelegateProperty>(NewProperty))
     {
