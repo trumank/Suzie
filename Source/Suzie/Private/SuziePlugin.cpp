@@ -395,6 +395,217 @@ public:
 #endif
 };
 
+// Synthetic CppStructOps for dynamic structs that inherit from native structs with CppStructOps (e.g. FTableRowBase).
+// Ensures proper vtable initialization when struct memory is allocated, preventing crashes on virtual function calls.
+// Without this, structs like DataTable row types that inherit from FTableRowBase would have a null vtable pointer,
+// causing crashes when the engine calls virtual methods like OnDataTableChanged().
+class FDynamicStructCppStructOps : public UScriptStruct::ICppStructOps
+{
+    UScriptStruct::ICppStructOps* ParentCppStructOps;
+    UScriptStruct* DynamicStruct;
+    int32 ParentInitializedSize;
+    bool bHasDestructor;
+
+public:
+    FDynamicStructCppStructOps(int32 InSize, int32 InAlignment, UScriptStruct::ICppStructOps* InParentOps, UScriptStruct* InStruct)
+        : ICppStructOps(InSize, InAlignment)
+        , ParentCppStructOps(InParentOps)
+        , DynamicStruct(InStruct)
+        , ParentInitializedSize(InParentOps ? InParentOps->GetSize() : 0)
+        , bHasDestructor(false)
+    {
+        // Destructor is needed if the parent needs destruction or if any child properties need destruction
+        if (InParentOps && InParentOps->HasDestructor())
+        {
+            bHasDestructor = true;
+        }
+        if (!bHasDestructor && InStruct)
+        {
+            for (FProperty* P = InStruct->DestructorLink; P; P = P->DestructorLinkNext)
+            {
+                if (!P->IsInContainer(ParentInitializedSize) && !P->HasAnyPropertyFlags(CPF_NoDestructor))
+                {
+                    bHasDestructor = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    virtual FCapabilities GetCapabilities() const override
+    {
+        FCapabilities Caps = {};
+        Caps.HasZeroConstructor = false;
+        Caps.HasDestructor = bHasDestructor;
+        Caps.IsPlainOldData = false;
+        Caps.HasNoopConstructor = false;
+        return Caps;
+    }
+
+    virtual void Construct(void* Dest) override
+    {
+        // Zero the entire buffer to ensure deterministic initialization regardless of prior memory content
+        FMemory::Memzero(Dest, GetSize());
+
+        // Call parent's constructor to initialize the vtable pointer
+        if (ParentCppStructOps && !ParentCppStructOps->HasZeroConstructor())
+        {
+            ParentCppStructOps->Construct(Dest);
+        }
+
+        // Initialize child properties that need non-zero construction
+        if (DynamicStruct)
+        {
+            for (FProperty* Property = DynamicStruct->PropertyLink; Property; Property = Property->PropertyLinkNext)
+            {
+                if (!Property->IsInContainer(ParentInitializedSize) && !Property->HasAnyPropertyFlags(CPF_ZeroConstructor))
+                {
+                    Property->InitializeValue_InContainer(Dest);
+                }
+            }
+        }
+    }
+
+    virtual void ConstructForTests(void* Dest) override
+    {
+        Construct(Dest);
+    }
+
+    virtual void Destruct(void* Dest) override
+    {
+        // Destroy child properties that need destruction
+        if (DynamicStruct)
+        {
+            for (FProperty* P = DynamicStruct->DestructorLink; P; P = P->DestructorLinkNext)
+            {
+                if (!P->IsInContainer(ParentInitializedSize) && !P->HasAnyPropertyFlags(CPF_NoDestructor))
+                {
+                    P->DestroyValue_InContainer(Dest);
+                }
+            }
+        }
+        // Call parent's destructor for C++ cleanup (vtable, etc.)
+        if (ParentCppStructOps && ParentCppStructOps->HasDestructor())
+        {
+            ParentCppStructOps->Destruct(Dest);
+        }
+    }
+
+    // No-op / false-returning implementations for remaining pure virtual methods
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
+    virtual bool Serialize(FArchive& Ar, void* Data, UStruct* DefaultsStruct, const void* Defaults) override { return false; }
+    virtual bool Serialize(FStructuredArchive::FSlot Slot, void* Data, UStruct* DefaultsStruct, const void* Defaults) override { return false; }
+#else
+    virtual bool Serialize(FArchive& Ar, void* Data) override { return false; }
+    virtual bool Serialize(FStructuredArchive::FSlot Slot, void* Data) override { return false; }
+#endif
+    virtual void PostSerialize(const FArchive& Ar, void* Data) override {}
+    virtual bool NetSerialize(FArchive& Ar, class UPackageMap* Map, bool& bOutSuccess, void* Data) override { return false; }
+    virtual bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParms, void* Data) override { return false; }
+    virtual void PostScriptConstruct(void* Data) override {}
+    virtual void GetPreloadDependencies(void* Data, TArray<UObject*>& OutDeps) override {}
+    virtual bool Copy(void* Dest, void const* Src, int32 ArrayDim) override { return false; }
+    virtual bool Identical(const void* A, const void* B, uint32 PortFlags, bool& bOutResult) override { return false; }
+    virtual bool ExportTextItem(FString& ValueStr, const void* PropertyValue, const void* DefaultValue, class UObject* Parent, int32 PortFlags, class UObject* ExportRootScope) override { return false; }
+    virtual bool ImportTextItem(const TCHAR*& Buffer, void* Data, int32 PortFlags, class UObject* OwnerObject, FOutputDevice* ErrorText) override { return false; }
+    virtual bool FindInnerPropertyInstance(FName PropertyName, const void* Data, const FProperty*& OutProp, const void*& OutData) const override { return false; }
+    virtual TPointerToAddStructReferencedObjects AddStructReferencedObjects() override { return nullptr; }
+    virtual bool SerializeFromMismatchedTag(struct FPropertyTag const& Tag, FArchive& Ar, void* Data) override { return false; }
+    virtual bool StructuredSerializeFromMismatchedTag(struct FPropertyTag const& Tag, FStructuredArchive::FSlot Slot, void* Data) override { return false; }
+    virtual uint32 GetStructTypeHash(const void* Src) override { return 0; }
+    virtual void InitializeIntrusiveUnsetOptionalValue(void* Data) const override {}
+    virtual bool IsIntrusiveOptionalValueSet(const void* Data) const override { return false; }
+    virtual void ClearIntrusiveOptionalValue(void* Data) const override {}
+    virtual bool IsIntrusiveOptionalSafeForGC() const override { return false; }
+#if WITH_EDITOR
+    virtual bool CanEditChange(const FEditPropertyChain& PropertyChain, const void* Data) const override { return true; }
+#endif
+    virtual EPropertyVisitorControlFlow Visit(FPropertyVisitorContext& Context, const TFunctionRef<EPropertyVisitorControlFlow(const FPropertyVisitorContext& Context)> InFunc) const override { return EPropertyVisitorControlFlow::StepOver; }
+    virtual void* ResolveVisitedPathInfo(void* Data, const FPropertyVisitorInfo& Info) const override { return nullptr; }
+};
+
+// Helper: walks the super struct chain to find the nearest ancestor with CppStructOps
+static UScriptStruct::ICppStructOps* FindNearestAncestorCppStructOps(UScriptStruct* Struct)
+{
+    UScriptStruct* Current = Cast<UScriptStruct>(Struct->GetSuperStruct());
+    while (Current)
+    {
+        UScriptStruct::ICppStructOps* Ops = Current->GetCppStructOps();
+        if (Ops)
+        {
+            return Ops;
+        }
+        Current = Cast<UScriptStruct>(Current->GetSuperStruct());
+    }
+    return nullptr;
+}
+
+// Helper: checks if a property type can be represented as a blueprint pin.
+// Based on UEdGraphSchema_K2::GetPropertyCategoryInfo logic from the engine.
+// Container types are unwrapped and their inner/key/value types are checked recursively.
+static bool IsPropertyTypeBlueprintSupported(const FProperty* Property)
+{
+    // Unwrap container types and check inner properties
+    if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Property))
+    {
+        return ArrayProp->Inner && IsPropertyTypeBlueprintSupported(ArrayProp->Inner);
+    }
+    if (const FSetProperty* SetProp = CastField<FSetProperty>(Property))
+    {
+        return SetProp->ElementProp && IsPropertyTypeBlueprintSupported(SetProp->ElementProp);
+    }
+    if (const FMapProperty* MapProp = CastField<FMapProperty>(Property))
+    {
+        // Weak object properties are not supported as map values
+        if (MapProp->ValueProp && CastField<FWeakObjectProperty>(MapProp->ValueProp))
+        {
+            return false;
+        }
+        return MapProp->KeyProp && IsPropertyTypeBlueprintSupported(MapProp->KeyProp)
+            && MapProp->ValueProp && IsPropertyTypeBlueprintSupported(MapProp->ValueProp);
+    }
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
+    if (const FOptionalProperty* OptionalProp = CastField<FOptionalProperty>(Property))
+    {
+        return OptionalProp->GetValueProperty() && IsPropertyTypeBlueprintSupported(OptionalProp->GetValueProperty());
+    }
+#endif
+
+    // Primitive and common types that always map to blueprint pin categories
+    if (Property->IsA<FBoolProperty>()) return true;
+    if (Property->IsA<FIntProperty>()) return true;
+    if (Property->IsA<FInt64Property>()) return true;
+    if (Property->IsA<FFloatProperty>()) return true;
+    if (Property->IsA<FDoubleProperty>()) return true;
+    if (Property->IsA<FByteProperty>()) return true;
+    if (Property->IsA<FNameProperty>()) return true;
+    if (Property->IsA<FStrProperty>()) return true;
+    if (Property->IsA<FTextProperty>()) return true;
+
+    // Enum types
+    if (Property->IsA<FEnumProperty>()) return true;
+
+    // Object types (check derived types before base)
+    if (Property->IsA<FInterfaceProperty>()) return true;
+    if (Property->IsA<FClassProperty>()) return true;
+    if (Property->IsA<FSoftClassProperty>()) return true;
+    if (Property->IsA<FSoftObjectProperty>()) return true;
+    if (Property->IsA<FObjectPropertyBase>()) return true;
+
+    // Struct types
+    if (Property->IsA<FStructProperty>()) return true;
+
+    // Delegate types
+    if (Property->IsA<FDelegateProperty>()) return true;
+    if (Property->IsA<FMulticastDelegateProperty>()) return true;
+
+    // Field path
+    if (Property->IsA<FFieldPathProperty>()) return true;
+
+    // Anything else is not representable as a blueprint pin
+    return false;
+}
+
 // Note that new objects can be created from other threads, but we only touch this map when creating dynamic classes,
 // so we do not need an explicit mutex to guard the access to it during class initialization
 static TMap<UClass*, FDynamicClassConstructionData> DynamicClassConstructionData;
@@ -434,8 +645,9 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     const TArray<TSharedPtr<FJsonValue>>& Properties = ClassDefinition->GetArrayField(TEXT("properties"));
     for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
     {
-        // We want all properties to be editable, visible and blueprint assignable
-        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintAssignable;
+        // We want all properties to be editable and blueprint assignable. Blueprint visibility is
+        // conditionally widened in BuildProperty based on the property type and CPF_Edit/CPF_EditConst flags.
+        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintAssignable;
         if (FProperty* CreatedProperty = AddPropertyToStruct(Context, NewClass, PropertyDescriptor->AsObject(), ExtraPropertyFlags))
         {
             // Because this is a native class, we have to link the property offset manually here rather than expecting StaticLink to do it for us
@@ -567,8 +779,9 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     TArray<TSharedPtr<FJsonValue>> Properties = StructDefinition->GetArrayField(TEXT("properties"));
     for (const TSharedPtr<FJsonValue>& PropertyDescriptor : Properties)
     {
-        // We want all properties to be editable, visible and blueprint assignable
-        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_BlueprintAssignable;
+        // We want all properties to be editable and blueprint assignable. Blueprint visibility is
+        // conditionally widened in BuildProperty based on the property type and CPF_Edit/CPF_EditConst flags.
+        const EPropertyFlags ExtraPropertyFlags = CPF_Edit | CPF_BlueprintAssignable;
         AddPropertyToStruct(Context, NewStruct, PropertyDescriptor->AsObject(), ExtraPropertyFlags);
     }
     
@@ -585,6 +798,37 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     {
         NewStruct->MinAlignment = 1;
         NewStruct->SetPropertiesSize(1);
+    }
+
+    // If an ancestor struct has CppStructOps (e.g. FTableRowBase with virtual functions and a vtable pointer),
+    // we need to create synthetic CppStructOps for this dynamic struct. Without this, the vtable pointer at offset 0
+    // would never be initialized, causing crashes when the engine calls virtual methods like OnDataTableChanged().
+    UScriptStruct::ICppStructOps* AncestorCppStructOps = FindNearestAncestorCppStructOps(NewStruct);
+    if (AncestorCppStructOps)
+    {
+        // Ensure PropertiesSize is aligned so that GetStructureSize() == PropertiesSize
+        // This is required because InitializeStruct checks: Stride == CppStructOps.GetSize() && PropertiesSize == CppStructOps.GetSize()
+        const int32 AlignedSize = NewStruct->GetStructureSize();
+        if (NewStruct->GetPropertiesSize() != AlignedSize)
+        {
+            NewStruct->SetPropertiesSize(AlignedSize);
+        }
+
+        FTopLevelAssetPath StructAssetPath(Package->GetFName(), *ObjectName);
+        UScriptStruct::DeferCppStructOps(StructAssetPath,
+            new FDynamicStructCppStructOps(
+                NewStruct->GetPropertiesSize(),
+                NewStruct->GetMinAlignment(),
+                AncestorCppStructOps,
+                NewStruct
+            ));
+
+        // Reset and re-prepare so PrepareCppStructOps picks up our deferred synthetic CppStructOps
+        NewStruct->ClearCppStructOps();
+        NewStruct->PrepareCppStructOps();
+
+        UE_LOG(LogSuzie, Verbose, TEXT("Installed synthetic CppStructOps for struct '%s' (ancestor has vtable, size=%d)"),
+            *ObjectName, NewStruct->GetPropertiesSize());
     }
     
     UE_LOG(LogSuzie, Verbose, TEXT("Created struct: %s"), *ObjectName);
@@ -1064,6 +1308,21 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
         }
     }
 
+    // Access widening: forcefully widen editor-visible properties to blueprint-visible when the type supports it.
+    // This ensures as many properties as possible are accessible in blueprints without requiring explicit tagging.
+    // CPF_EditConst properties become read-only in blueprints; CPF_Edit properties become read-write.
+    if (IsPropertyTypeBlueprintSupported(NewProperty))
+    {
+        if (NewProperty->HasAnyPropertyFlags(CPF_EditConst))
+        {
+            NewProperty->PropertyFlags |= CPF_BlueprintVisible | CPF_BlueprintReadOnly;
+        }
+        else if (NewProperty->HasAnyPropertyFlags(CPF_Edit))
+        {
+            NewProperty->PropertyFlags |= CPF_BlueprintVisible;
+        }
+    }
+
     return NewProperty;
 }
 
@@ -1354,17 +1613,7 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
     const FDynamicClassConstructionData* TopLevelClassConstructionData = DynamicClassConstructionData.Find(TopLevelDynamicClass);
     checkf(TopLevelClassConstructionData, TEXT("Failed to find dynamic class construction data for dynamic class %s"), *TopLevelDynamicClass->GetPathName());
 
-    // Gather all dynamic classes that contribute to the object being constructed, starting at the top level one
-    // We need this list BEFORE applying subobject overrides to handle the entire hierarchy
-    TArray<const UClass*, TInlineAllocator<8>> DynamicClassHierarchyTree;
-    const UClass* CurrentDynamicClass = TopLevelDynamicClass;
-    while (CurrentDynamicClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
-    {
-        DynamicClassHierarchyTree.Add(CurrentDynamicClass);
-        CurrentDynamicClass = CurrentDynamicClass->GetSuperClass();
-    }
-
-    // Run logic necessary for the top level dynamic class object. That includes setting up default subobject overrides and the active archetype to use for property copying
+    // Run logic necessary for the top level dynamic class object. That includes setting up defautl subobject overrides and the active archetype to use for property copying
     {
         // If no explicit archetype has been provided for this object construction, or archetype is a CDO of the current class, set it to the default object archetype instead
         // This will ensure that correct property values are copied from the CDO for all object properties and subobjects are created using correct templates and not their CDO values
@@ -1375,59 +1624,40 @@ void FSuziePluginModule::PolymorphicClassConstructorInvocationHelper(const FObje
             ObjectInitializerAccess->ObjectArchetype = TopLevelClassConstructionData->DefaultObjectArchetype;
             ObjectInitializerAccess->bCopyTransientsFromClassDefaults = true; // we want to copy the transient property values from archetype as well
         }
-
-        // Collect subobject overrides from the ENTIRE dynamic class hierarchy, not just the top-level class.
-        // Child class overrides take precedence over parent class definitions, so we iterate from parent to child
-        // and let later entries overwrite earlier ones.
-        TMap<FName, UClass*> FinalSubobjectClasses;
-        TSet<FName> AllSuppressedSubobjects;
-        TArray<FNestedDefaultSubobjectOverrideData> AllNestedOverrides;
-
-        // Iterate from furthest parent to top-level class (reverse order)
-        for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
-        {
-            const FDynamicClassConstructionData* ClassConstructionData = DynamicClassConstructionData.Find(DynamicClassHierarchyTree[i]);
-            if (ClassConstructionData)
-            {
-                // Collect subobject classes - child overrides parent
-                for (const FDynamicObjectConstructionData& SubobjectData : ClassConstructionData->DefaultSubobjects)
-                {
-                    FinalSubobjectClasses.Add(SubobjectData.ObjectName, SubobjectData.ObjectClass);
-                }
-                // Collect suppressed subobjects
-                for (const FName& SuppressedName : ClassConstructionData->SuppressedDefaultSubobjects)
-                {
-                    AllSuppressedSubobjects.Add(SuppressedName);
-                }
-                // Collect nested overrides
-                AllNestedOverrides.Append(ClassConstructionData->DefaultSubobjectOverrides);
-            }
-        }
-
-        // Apply all subobject class overrides before running any constructor
-        for (const auto& [SubobjectName, SubobjectClass] : FinalSubobjectClasses)
+        
+        // Before we execute the class constructor of our parent native class, apply overrides to subobject types that the parent class might create
+        for (const FDynamicObjectConstructionData& SubobjectConstructionData : TopLevelClassConstructionData->DefaultSubobjects)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
-            ObjectInitializer.SetDefaultSubobjectClass(SubobjectName, SubobjectClass);
+            ObjectInitializer.SetDefaultSubobjectClass(SubobjectConstructionData.ObjectName, SubobjectConstructionData.ObjectClass);
         }
-
-        // Disable creation of certain subobjects that any class in the hierarchy does not want to have
-        for (const FName& DisabledSubobjectName : AllSuppressedSubobjects)
+        // Disable creation of certain subobjects that this class does not want to have
+        for (const FName& DisabledSubobjectName : TopLevelClassConstructionData->SuppressedDefaultSubobjects)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
             ObjectInitializer.DoNotCreateDefaultSubobject(DisabledSubobjectName);
         }
-
-        // Apply overrides for nested subobject types
-        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : AllNestedOverrides)
+        
+        // Also apply overrides for nested subobject types. These are very rare but should be handled regardless
+        // TODO: We do not handle disabled nested default subobjects currently. Case is extremely rare and nested subobjects are extremely rare themselves, so this can be revised later
+        for (const FNestedDefaultSubobjectOverrideData& SubobjectOverrideData : TopLevelClassConstructionData->DefaultSubobjectOverrides)
         {
             // ReSharper disable once CppExpressionWithoutSideEffects
             ObjectInitializer.SetNestedDefaultSubobjectClass(SubobjectOverrideData.SubobjectPath, SubobjectOverrideData.OverridenClass);
         }
     }
-
+    
     // Run the constructor for that parent native class now to get an initialized object of the parent class type and parent default subobjects
     NativeParentClass->ClassConstructor(ObjectInitializer);
+
+    // Gather all dynamic classes that contribute to the object being constructed, starting at the top level one
+    TArray<const UClass*, TInlineAllocator<8>> DynamicClassHierarchyTree;
+    const UClass* CurrentDynamicClass = TopLevelDynamicClass;
+    while (CurrentDynamicClass->ClassConstructor == &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper)
+    {
+        DynamicClassHierarchyTree.Add(CurrentDynamicClass);
+        CurrentDynamicClass = CurrentDynamicClass->GetSuperClass();
+    }
 
     // Run constructors for each dynamic class in reverse order, e.g. from the furthest parent to the top level class
     for (int32 i = DynamicClassHierarchyTree.Num() - 1; i >= 0; i--)
@@ -1447,15 +1677,11 @@ void FSuziePluginModule::ExecutePolymorphicClassConstructorFrameForDynamicClass(
     {
         Property->InitializeValue_InContainer(ObjectInitializer.GetObj());
     }
-
+    
     // Create missing default subobjects for this dynamic class type
-    // NOTE: We check by NAME only (using UObject::StaticClass()), not by specific class type.
-    // This is because a child class in the hierarchy may have overridden the subobject's class type,
-    // and the subobject will have been created with the overridden type (via SetDefaultSubobjectClass).
-    // If we checked by the original class type, we wouldn't find it and would try to create a duplicate.
     for (const FDynamicObjectConstructionData& SubobjectConstructionData : ClassConstructionData->DefaultSubobjects)
     {
-        if (StaticFindObjectFast(UObject::StaticClass(), ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
+        if (StaticFindObjectFast(SubobjectConstructionData.ObjectClass, ObjectInitializer.GetObj(), SubobjectConstructionData.ObjectName) == nullptr)
         {
             ObjectInitializer.CreateDefaultSubobject(ObjectInitializer.GetObj(),
                 SubobjectConstructionData.ObjectName, UObject::StaticClass(), SubobjectConstructionData.ObjectClass,
@@ -1601,7 +1827,9 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
 
     // Create an archetype by duplicating the CDO. We will use that archetype instead of CDO for priming the instances with correct values
     // Do not create archetypes for NetConnection-derived classes, they have faulty shutdown logic leading to a crash on exit
-    if (!Class->IsChildOf<UNetConnection>())
+    // Do not create archetypes for GameInstance-derived classes, EndPlayMap iterates all UGameInstance objects and calls
+    // MarkAsGarbage on them which asserts !IsRooted(), but our archetypes are rooted via AddToRoot to prevent GC
+    if (!Class->IsChildOf<UNetConnection>() && !Class->IsChildOf<UGameInstance>())
     {
         const FString ArchetypeObjectName = TEXT("InitializationArchetype__") + Class->GetName();
         {
