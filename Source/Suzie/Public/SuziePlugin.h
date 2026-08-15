@@ -5,6 +5,9 @@
 #include "Styling/SlateStyle.h"
 #include "Framework/Commands/UICommandList.h"
 
+class FJsonObject;
+class FJsonValue;
+
 DECLARE_LOG_CATEGORY_EXTERN(LogSuzie, Log, All);
 
 struct FDynamicClassGenerationContext
