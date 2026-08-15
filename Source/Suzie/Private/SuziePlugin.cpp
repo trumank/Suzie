@@ -656,6 +656,8 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
 
 UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath)
 {
+    if (FunctionPath.IsEmpty()) return nullptr;
+
     // Check if the function already exists
     if (UFunction* ExistingFunction = FindObject<UFunction>(nullptr, *FunctionPath))
     {
