@@ -1,4 +1,5 @@
 ﻿#include "SuzieDecompressionHelper.h"
+#include "SuziePlugin.h"
 
 THIRD_PARTY_INCLUDES_START
 #include "zlib.h"
@@ -6,6 +7,8 @@ THIRD_PARTY_INCLUDES_END
 
 bool FSuzieDecompressionHelper::DecompressMemoryGzip(const TArray<uint8>& CompressedData, TArray<uint8>& OutDecompressedData)
 {
+	UE_LOG(LogSuzie, Verbose, TEXT("Attempting to decompress %u bytes of gzip data"), CompressedData.Num());
+
 	z_stream GzipStream;
 	GzipStream.zalloc = &FSuzieDecompressionHelper::ZlibAlloc;
 	GzipStream.zfree = &FSuzieDecompressionHelper::ZlibFree;
@@ -17,7 +20,11 @@ bool FSuzieDecompressionHelper::DecompressMemoryGzip(const TArray<uint8>& Compre
 
 	// Init deflate settings to use GZIP
 	constexpr int32 GzipStreamEncoding = 16;
-	inflateInit2(&GzipStream, MAX_WBITS | GzipStreamEncoding);
+	if (inflateInit2(&GzipStream, MAX_WBITS | GzipStreamEncoding) != Z_OK)
+	{
+		UE_LOG(LogSuzie, Error, TEXT("Failed to initialize gzip decompression"));
+		return false;
+	}
 
 	uint8 LocalDecompressionBuffer[4096];
 	GzipStream.next_out = LocalDecompressionBuffer;
@@ -36,11 +43,18 @@ bool FSuzieDecompressionHelper::DecompressMemoryGzip(const TArray<uint8>& Compre
 	}
 	inflateEnd(&GzipStream);
 
+	if (InflateStatusCode != Z_STREAM_END)
+	{
+		UE_LOG(LogSuzie, Error, TEXT("Gzip decompression failed with status code %d"), InflateStatusCode);
+		return false;
+	}
+
 	// Append final decompressed bytes to the output
 	const int32 BytesWritten = sizeof(LocalDecompressionBuffer) - GzipStream.avail_out;
 	OutDecompressedData.Append(LocalDecompressionBuffer, BytesWritten);
-	
-	return InflateStatusCode == Z_STREAM_END;
+
+	UE_LOG(LogSuzie, Verbose, TEXT("Successfully decompressed %u bytes"), OutDecompressedData.Num());
+	return true;
 }
 
 void* FSuzieDecompressionHelper::ZlibAlloc(void*, unsigned int size, unsigned int num)

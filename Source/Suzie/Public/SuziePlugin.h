@@ -75,7 +75,7 @@ private:
     UClass* FindOrCreateClass(FDynamicClassGenerationContext& Context, const FString& ClassPath);
     UScriptStruct* FindOrCreateScriptStruct(FDynamicClassGenerationContext& Context, const FString& StructPath);
     UEnum* FindOrCreateEnum(FDynamicClassGenerationContext& Context, const FString& EnumPath);
-    UFunction* FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath);
+    UFunction* FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath, UClass* OwningClass = nullptr);
 
     static UClass* GetNativeParentClassForDynamicClass(const UClass* InDynamicClass);
     static UClass* GetDynamicParentClassForBlueprintClass(UClass* InBlueprintClass);
