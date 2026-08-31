@@ -89,7 +89,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         if (!FFileHelper::LoadFileToString(JsonContent, *(JsonClassesPath / JsonFileName)))
         {
             UE_LOG(LogSuzie, Error, TEXT("Failed to read JSON file: %s"), *JsonFileName);
-            return;
+            continue;
         }
     
         // Parse the JSON
@@ -117,7 +117,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         if (!FFileHelper::LoadFileToArray(CompressedFileContents, *(JsonClassesPath / CompressedJsonFileName)))
         {
             UE_LOG(LogSuzie, Error, TEXT("Failed to read compressed JSON file: %s"), *CompressedJsonFileName);
-            return;
+            continue;
         }
 
         // Attempt to decompress the file as Gzip archive
@@ -125,7 +125,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         if (!FSuzieDecompressionHelper::DecompressMemoryGzip(CompressedFileContents, DecompressedFileContents))
         {
             UE_LOG(LogSuzie, Error, TEXT("Failed to decompress compressed JSON file as valid GZIP: %s"), *CompressedJsonFileName);
-            return;
+            continue;
         }
 
         // Parse the binary stream into the string. UE will attempt to guess the encoding for us
@@ -137,7 +137,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
         TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonContent);
         if (!FJsonSerializer::Deserialize(JsonReader, JsonObject) || !JsonObject.IsValid())
         {
-            UE_LOG(LogSuzie, Error, TEXT("Failed to parse compressed JSON in file: %s"), *CompressedJsonFileName);
+            UE_LOG(LogSuzie, Error, TEXT("Failed to parse compressed JSON in file: %s - invalid JSON format"), *CompressedJsonFileName);
             continue;
         }
         CreateDynamicClassesForJsonObject(JsonObject);
@@ -146,22 +146,37 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
 
 void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJsonObject>& RootObject)
 {
+    UE_LOG(LogSuzie, Display, TEXT("CreateDynamicClassesForJsonObject: entered"));
     const TSharedPtr<FJsonObject>* Objects;
     if (!RootObject->TryGetObjectField(TEXT("objects"), Objects))
     {
         UE_LOG(LogSuzie, Error, TEXT("Missing 'objects' map"));
+        UE_LOG(LogSuzie, Display, TEXT("CreateDynamicClassesForJsonObject: exiting - missing objects map"));
         return;
     }
 
-    // Create class generation context
+    UE_LOG(LogSuzie, Display, TEXT("CreateDynamicClassesForJsonObject: found objects map"));
     FDynamicClassGenerationContext ClassGenerationContext;
     ClassGenerationContext.GlobalObjectMap = *Objects;
 
-    // Create classes, script structs and global delegate functions
+// Create classes, script structs and global delegate functions
+    UE_LOG(LogSuzie, Display, TEXT("CreateDynamicClassesForJsonObject: iterating over objects map"));
     for (auto It = (*Objects)->Values.CreateConstIterator(); It; ++It)
     {
         FString ObjectPath = It.Key();
-        FString Type = It.Value()->AsObject()->GetStringField(TEXT("type"));
+        const TSharedPtr<FJsonObject> ObjectJson = It.Value()->AsObject();
+        if (!ObjectJson.IsValid())
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("CreateDynamicClassesForJsonObject: skipping malformed entry for %s (value is not a JSON object)"), *ObjectPath);
+            continue;
+        }
+        FString Type;
+        if (!ObjectJson->TryGetStringField(TEXT("type"), Type))
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("CreateDynamicClassesForJsonObject: skipping entry for %s (missing 'type' field)"), *ObjectPath);
+            continue;
+        }
+        UE_LOG(LogSuzie, Display, TEXT("CreateDynamicClassesForJsonObject: processing %s (type: %s)"), *ObjectPath, *Type);
 
 #if ENGINE_MAJOR_VERSION < 5
         // UE4: Skip problematic modules that cause crashes in Content Browser's native class hierarchy
@@ -182,6 +197,7 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
             ParseObjectPath(ObjectPath, PackageName, ClassName);
             if (ClassName.StartsWith(TEXT("Default__")))
             {
+                UE_LOG(LogSuzie, Warning, TEXT("Skipping Default__ class %s (these are CDO stubs, not user classes)"), *ObjectPath);
                 continue;
             }
             UE_LOG(LogSuzie, Verbose, TEXT("Creating class %s"), *ObjectPath);
@@ -201,6 +217,26 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
         {
             UE_LOG(LogSuzie, VeryVerbose, TEXT("Creating function %s"), *ObjectPath);
             FindOrCreateFunction(ClassGenerationContext, ObjectPath);
+        }
+        else if (Type.IsEmpty())
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Unknown object type for %s (missing 'type' field), attempting class creation"), *ObjectPath);
+            if (!ObjectPath.Contains(TEXT("Default__")))
+            {
+                FindOrCreateClass(ClassGenerationContext, ObjectPath);
+            }
+        }
+        else if (Type == TEXT("Package") || Type == TEXT("Object"))
+        {
+            UE_LOG(LogSuzie, Display, TEXT("Skipping non-creatable type %s for %s"), *Type, *ObjectPath);
+        }
+        else
+        {
+            UE_LOG(LogSuzie, Warning, TEXT("Unknown object type %s for %s, attempting class creation"), *Type, *ObjectPath);
+            if (!ObjectPath.Contains(TEXT("Default__")))
+            {
+                FindOrCreateClass(ClassGenerationContext, ObjectPath);
+            }
         }
     }
 
@@ -222,6 +258,8 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
     {
         FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
     }
+
+    UE_LOG(LogSuzie, Display, TEXT("CreateDynamicClassesForJsonObject: finished"));
 }
 
 UPackage* FSuziePluginModule::FindOrCreatePackage(FDynamicClassGenerationContext& Context, const FString& PackageName)
@@ -285,8 +323,15 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     const TSharedPtr<FJsonObject> ClassDefinition = Context.GlobalObjectMap->GetObjectField(ClassPath);
     checkf(ClassDefinition.IsValid(), TEXT("Failed to find class object by path %s"), *ClassPath);
     
-    const FString ObjectType = ClassDefinition->GetStringField(TEXT("type"));
-    checkf(ObjectType == TEXT("Class"), TEXT("FindOrCreateUnregisteredClass expected Class object %s, got object of type %s"), *ClassPath, *ObjectType);
+    FString ObjectType;
+    if (!ClassDefinition.IsValid() || !ClassDefinition->TryGetStringField(TEXT("type"), ObjectType))
+    {
+        ObjectType = FString();
+    }
+    if (ObjectType != TEXT("Class"))
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateUnregisteredClass: expected Class type for %s, got %s, attempting creation anyway"), *ClassPath, *ObjectType);
+    }
 
     // Meatloaf bug (commit d8179e8): UClass-derived native classes will produce Null super_struct, which will crash Suzie down the line
     // Attempt to recover by assuming UClass parent in this case for this class
@@ -302,8 +347,18 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     FString ClassName;
     ParseObjectPath(ClassPath, PackageName, ClassName);
 
+    // PackageName may be a class path (e.g. /Script/AIModule.Default__AIController) rather than a clean package name
+    // when ClassPath contains a ':' sub-object separator. Extract the actual package name by taking the part before
+    // the first '.', which separates the package module path from the class name.
+    FString ActualPackageName = PackageName;
+    int32 DotIndex;
+    if (ActualPackageName.FindChar('.', DotIndex))
+    {
+        ActualPackageName = ActualPackageName.Left(DotIndex);
+    }
+
     // DeferredRegister for UClass will automatically find the package by name, but we should still prime it before that
-    FindOrCreatePackage(Context, PackageName);
+    FindOrCreatePackage(Context, ActualPackageName);
 
     // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
     static const TPair<FString, EClassFlags> ClassFlagNameLookupData[] = {
@@ -348,6 +403,13 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         ParentClass->ClassVTableHelperCtorCaller,
         MoveTemp(ClassStaticFunctions));
 #else
+    // Safety: If parent's ClassAddReferencedObjects is null (can happen for dynamic parents), fall back to UObject's implementation
+    auto NativeAddReferencedObjects = ParentClass->ClassAddReferencedObjects;
+    if (NativeAddReferencedObjects == nullptr)
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateUnregisteredClass: Parent class %s has null ClassAddReferencedObjects, falling back to UObject::AddReferencedObjects"), *ParentClass->GetPathName());
+        NativeAddReferencedObjects = &UObject::AddReferencedObjects;
+    }
     ::new (ConstructedClassObject)UClass(
         EC_StaticConstructor,
         *ClassName,
@@ -359,7 +421,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
         RF_Public | RF_MarkAsNative | RF_MarkAsRootSet,
         &FSuziePluginModule::PolymorphicClassConstructorInvocationHelper,
         ParentClass->ClassVTableHelperCtorCaller,
-        ParentClass->ClassAddReferencedObjects);
+        NativeAddReferencedObjects);
 #endif
 
     //Set super structure and ClassWithin (they are required prior to registering)
@@ -376,7 +438,7 @@ UClass* FSuziePluginModule::FindOrCreateUnregisteredClass(FDynamicClassGeneratio
     
     //Register pending object, apply class flags, set static type info and link it
     ConstructedClassObject->RegisterDependencies();
-    ConstructedClassObject->DeferredRegister(UClass::StaticClass(), *PackageName, *ClassName);
+    ConstructedClassObject->DeferredRegister(UClass::StaticClass(), *ActualPackageName, *ClassName);
 
     Context.ClassesPendingConstruction.Add(ConstructedClassObject, ClassPath);
     Context.UnregisteredDynamicClassConstructionStack.Remove(ClassPath);
@@ -512,9 +574,21 @@ UClass* FSuziePluginModule::FindOrCreateClass(FDynamicClassGenerationContext& Co
     {
         FString ChildPath = FunctionObjectPathValue->AsString();
         const TSharedPtr<FJsonObject> ChildObject = Context.GlobalObjectMap->GetObjectField(ChildPath);
-        if (ChildObject && ChildObject->GetStringField(TEXT("type")) == TEXT("Function"))
+        if (ChildObject)
         {
-            AddFunctionToClass(Context, NewClass, ChildPath);
+            FString ChildType;
+            if (!ChildObject.IsValid() || !ChildObject->TryGetStringField(TEXT("type"), ChildType))
+            {
+                ChildType = FString();
+            }
+            if (ChildType == TEXT("Function") || ChildType.IsEmpty())
+            {
+                AddFunctionToClass(Context, NewClass, ChildPath);
+            }
+            else
+            {
+                UE_LOG(LogSuzie, Verbose, TEXT("Skipping non-Function child %s (type: %s)"), *ChildPath, *ChildType);
+            }
         }
     }
 
@@ -563,8 +637,15 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     const TSharedPtr<FJsonObject> StructDefinition = Context.GlobalObjectMap->GetObjectField(StructPath);
     checkf(StructDefinition.IsValid(), TEXT("Failed to find script struct object by path %s"), *StructPath);
     
-    const FString ObjectType = StructDefinition->GetStringField(TEXT("type"));
-    checkf(ObjectType == TEXT("ScriptStruct"), TEXT("FindOrCreateScriptStruct expected ScriptStruct object %s, got object of type %s"), *StructPath, *ObjectType);
+    FString ObjectType;
+    if (!StructDefinition.IsValid() || !StructDefinition->TryGetStringField(TEXT("type"), ObjectType))
+    {
+        ObjectType = FString();
+    }
+    if (ObjectType != TEXT("ScriptStruct"))
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateScriptStruct: expected ScriptStruct type for %s, got %s, attempting creation anyway"), *StructPath, *ObjectType);
+    }
 
     // Resolve parent struct for this struct before we attempt to create this struct
     UScriptStruct* SuperScriptStruct = nullptr;
@@ -653,8 +734,15 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     const TSharedPtr<FJsonObject> EnumDefinition = Context.GlobalObjectMap->GetObjectField(EnumPath);
     checkf(EnumDefinition.IsValid(), TEXT("Failed to find enum object by path %s"), *EnumPath);
     
-    const FString ObjectType = EnumDefinition->GetStringField(TEXT("type"));
-    checkf(ObjectType == TEXT("Enum"), TEXT("FindOrCreateEnum expected Enum object %s, got object of type %s"), *EnumPath, *ObjectType);
+    FString ObjectType;
+    if (!EnumDefinition.IsValid() || !EnumDefinition->TryGetStringField(TEXT("type"), ObjectType))
+    {
+        ObjectType = FString();
+    }
+    if (ObjectType != TEXT("Enum"))
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateEnum: expected Enum type for %s, got %s, attempting creation anyway"), *EnumPath, *ObjectType);
+    }
 
     FString PackageName;
     FString ObjectName;
@@ -703,30 +791,50 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     return NewEnum;
 }
 
-UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath)
+UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath, UClass* OwningClass)
 {
+    if (FunctionPath.IsEmpty())
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateFunction: empty function path, skipping"));
+        return nullptr;
+    }
+
     // Check if the function already exists
     if (UFunction* ExistingFunction = FindObject<UFunction>(nullptr, *FunctionPath))
     {
         return ExistingFunction;
     }
     
-    FString ClassPathOrPackageName;
     FString ObjectName;
-    ParseObjectPath(FunctionPath, ClassPathOrPackageName, ObjectName);
-
-    // Function can be outered either to a class or to a package, we can decide based on whenever there is a separator in the path
     UObject* FunctionOuterObject;
-    int32 PackageNameSeparatorIndex{};
-    if (ClassPathOrPackageName.FindChar('.', PackageNameSeparatorIndex))
+
+    // If an owning class is provided, use it as the outer directly
+    // This ensures class-member functions are properly associated with their parent class
+    if (OwningClass)
     {
-        // This is a class path because it is at least two levels deep. We do not need our outer to be registered, just to exist
-        FunctionOuterObject = FindOrCreateUnregisteredClass(Context, ClassPathOrPackageName);
+        FunctionOuterObject = OwningClass;
+        // Extract just the name component from the full path (e.g. "/Script/Module.Class:FuncName" -> "FuncName")
+        FString UnusedPath;
+        ParseObjectPath(FunctionPath, UnusedPath, ObjectName);
+        UE_LOG(LogSuzie, Verbose, TEXT("FindOrCreateFunction: OwningClass provided for %s, extracted function name: %s"), *FunctionPath, *ObjectName);
     }
     else
     {
-        // This is a package and this function is a top level function (most likely a delegate signature)
-        FunctionOuterObject = FindOrCreatePackage(Context, ClassPathOrPackageName);
+        FString ClassPathOrPackageName;
+        ParseObjectPath(FunctionPath, ClassPathOrPackageName, ObjectName);
+
+        // Function can be outered either to a class or to a package, we can decide based on whenever there is a separator in the path
+        int32 PackageNameSeparatorIndex{};
+        if (ClassPathOrPackageName.FindChar('.', PackageNameSeparatorIndex))
+        {
+            // This is a class path because it is at least two levels deep. We do not need our outer to be registered, just to exist
+            FunctionOuterObject = FindOrCreateUnregisteredClass(Context, ClassPathOrPackageName);
+        }
+        else
+        {
+            // This is a package and this function is a top level function (most likely a delegate signature)
+            FunctionOuterObject = FindOrCreatePackage(Context, ClassPathOrPackageName);
+        }
     }
 
     // Check if the function already exists in its parent object
@@ -770,8 +878,26 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     const TSharedPtr<FJsonObject> FunctionDefinition = Context.GlobalObjectMap->GetObjectField(FunctionPath);
     checkf(FunctionDefinition.IsValid(), TEXT("Failed to find function object by path %s"), *FunctionPath);
     
-    const FString ObjectType = FunctionDefinition->GetStringField(TEXT("type"));
-    checkf(ObjectType == TEXT("Function"), TEXT("FindOrCreateFunction expected Function object %s, got object of type %s"), *FunctionPath, *ObjectType);
+    FString ObjectType;
+    if (!FunctionDefinition.IsValid() || !FunctionDefinition->TryGetStringField(TEXT("type"), ObjectType))
+    {
+        ObjectType = FString();
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateFunction: missing 'type' field for %s, will attempt creation without type-based dispatch"), *FunctionPath);
+    }
+    if (ObjectType == TEXT("Function"))
+    {
+        // Proceed with normal function creation
+    }
+    else if (ObjectType.IsEmpty())
+    {
+        UE_LOG(LogSuzie, Verbose, TEXT("FindOrCreateFunction: type field empty for %s, attempting creation anyway"), *FunctionPath);
+        // Fall through to create the function without type-based dispatch
+    }
+    else
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("FindOrCreateFunction: unexpected object type %s for %s, attempting creation anyway"), *ObjectType, *FunctionPath);
+        // Fall through to create the function without type-based dispatch
+    }
     
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> FunctionFlagNames = ParseFlags(FunctionDefinition->GetStringField(TEXT("function_flags")));
@@ -908,7 +1034,8 @@ FProperty* FSuziePluginModule::AddPropertyToStruct(FDynamicClassGenerationContex
 
 void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Context, UClass* Class, const FString& FunctionPath, const EFunctionFlags ExtraFunctionFlags)
 {
-    if (UFunction* NewFunction = FindOrCreateFunction(Context, FunctionPath))
+    UE_LOG(LogSuzie, VeryVerbose, TEXT("Adding function %s to class %s"), *FunctionPath, *Class->GetName());
+    if (UFunction* NewFunction = FindOrCreateFunction(Context, FunctionPath, Class))
     {
         // Append additional flags to the function
         NewFunction->FunctionFlags |= ExtraFunctionFlags;
@@ -935,7 +1062,11 @@ void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Cont
         // Add the function to the function lookup for the class
         Class->AddFunctionToFunctionMap(NewFunction, NewFunction->GetFName());
 
-        UE_LOG(LogSuzie, VeryVerbose, TEXT("Added function %s to class %s"), *NewFunction->GetName(), *Class->GetName());
+        UE_LOG(LogSuzie, Verbose, TEXT("Added function %s (FName: %s) to class %s"), *FunctionPath, *NewFunction->GetFName().ToString(), *Class->GetName());
+    }
+    else
+    {
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to create or find function %s for class %s"), *FunctionPath, *Class->GetName());
     }
 }
 
@@ -1031,7 +1162,7 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     FProperty* NewProperty = CastField<FProperty>(FField::Construct(FName(*PropertyType), Owner, FName(*PropertyName), RF_Public));
     if (NewProperty == nullptr)
     {
-        UE_LOG(LogSuzie, Warning, TEXT("Failed to create property of type %s: not supported"), *PropertyType);
+        UE_LOG(LogSuzie, Warning, TEXT("Failed to create property of type %s: not supported (available: StrProperty, FloatProperty, IntProperty, BoolProperty, NameProperty, TextProperty, ByteProperty, ArrayProperty, StructProperty, EnumProperty, ObjectProperty, ClassProperty, SetProperty, MapProperty, DelegateProperty, MulticastDelegateProperty)"), *PropertyType);
         return nullptr;
     }
     
@@ -1091,13 +1222,21 @@ FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Con
     }
     else if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(NewProperty))
     {
-        UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        UFunction* SignatureFunction = nullptr;
+        if (PropertyJson->HasTypedField<EJson::String>(TEXT("signature_function")))
+        {
+            SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        }
         // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
         DelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
     }
     else if (FMulticastDelegateProperty* MulticastDelegateProperty = CastField<FMulticastDelegateProperty>(NewProperty))
     {
-        UFunction* SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        UFunction* SignatureFunction = nullptr;
+        if (PropertyJson->HasTypedField<EJson::String>(TEXT("signature_function")))
+        {
+            SignatureFunction = FindOrCreateFunction(Context, PropertyJson->GetStringField(TEXT("signature_function")));
+        }
         // Fall back to FOnTimelineEvent delegate signature in the engine if real delegate signature could not be found
         MulticastDelegateProperty->SignatureFunction = SignatureFunction ? SignatureFunction : FindObject<UFunction>(nullptr, TEXT("/Script/Engine.OnTimelineEvent__DelegateSignature"));
     }
