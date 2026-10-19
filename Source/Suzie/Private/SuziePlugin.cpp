@@ -551,6 +551,8 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     static const TArray<TPair<FString, EStructFlags>> StructFlagNameLookup = {
         {TEXT("STRUCT_Atomic"), STRUCT_Atomic},
         {TEXT("STRUCT_Immutable"), STRUCT_Immutable},
+        // Computed at compile time, so the engine never sets it on Suzie's structs
+        {TEXT("STRUCT_HasInstancedReference"), STRUCT_HasInstancedReference},
     };
 
     // Convert struct flag names to the struct flags bitmask
