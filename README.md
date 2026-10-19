@@ -37,6 +37,20 @@ mkdir -p YourProject/Content/DynamicClasses
 cp output.jmap.gz YourProject/Content/DynamicClasses/
 ```
 
+### Optional: Override the Dump
+
+To make the editor see some of the game's types differently from the dump, for example to make a native function Blueprint-callable, put a `.overrides.json` file of the same name beside the jmap:
+```json
+{
+  "clear_flags": {"/Script/Game.Store": {"Capacity": ["CPF_BlueprintReadOnly"]}},
+  "set_flags": {"/Script/Game.Store": {"Refresh": ["FUNC_BlueprintCallable"]}},
+  "retype": {"/Script/Game.Cell": {"Traces": ["UInt16Property", "IntProperty"]}}
+}
+```
+```bash
+cp output.overrides.json YourProject/Content/DynamicClasses/
+```
+
 ### Step 3: Install Suzie Plugin
 
 1. Clone Suzie into project's Plugins directory:

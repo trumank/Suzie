@@ -27,6 +27,9 @@ DEFINE_LOG_CATEGORY(LogSuzie);
 
 #define LOCTEXT_NAMESPACE "FSuziePluginModule"
 
+static FString GetJmapOverridesFileName(const FString& JmapFileName);
+static void ApplyJmapOverrides(const TSharedPtr<FJsonObject>& RootObject, const FString& JsonClassesPath, const FString& JmapFileName);
+
 void FSuziePluginModule::StartupModule()
 {
     UE_LOG(LogSuzie, Display, TEXT("Suzie plugin starting"));
@@ -60,6 +63,18 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
     IFileManager::Get().FindFiles(CompressedJsonFileNames, *JsonClassesPath, TEXT("*.jmap.gz"));
     
     UE_LOG(LogSuzie, Display, TEXT("Found %d JSON class definition files"), JsonFileNames.Num() + CompressedJsonFileNames.Num());
+
+    TArray<FString> OverridesFileNames;
+    IFileManager::Get().FindFiles(OverridesFileNames, *JsonClassesPath, TEXT("*.overrides.json"));
+    for (const FString& OverridesFileName : OverridesFileNames)
+    {
+        const bool bHasJmap = JsonFileNames.ContainsByPredicate([&](const FString& Name) { return GetJmapOverridesFileName(Name) == OverridesFileName; })
+            || CompressedJsonFileNames.ContainsByPredicate([&](const FString& Name) { return GetJmapOverridesFileName(Name) == OverridesFileName; });
+        if (!bHasJmap)
+        {
+            UE_LOG(LogSuzie, Error, TEXT("Jmap overrides file %s has no jmap of its name beside it, so none of its overrides were applied"), *OverridesFileName);
+        }
+    }
 
     // This can potentially take some time so show a progress task
     const int32 TotalAmountOfWork = JsonFileNames.Num() + CompressedJsonFileNames.Num();
@@ -95,6 +110,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
             UE_LOG(LogSuzie, Error, TEXT("Failed to parse JSON in file: %s"), *JsonFileName);
             continue;
         }
+        ApplyJmapOverrides(JsonObject, JsonClassesPath, JsonFileName);
         CreateDynamicClassesForJsonObject(JsonObject);
     }
     
@@ -135,6 +151,7 @@ void FSuziePluginModule::ProcessAllJsonClassDefinitions()
             UE_LOG(LogSuzie, Error, TEXT("Failed to parse compressed JSON in file: %s"), *CompressedJsonFileName);
             continue;
         }
+        ApplyJmapOverrides(JsonObject, JsonClassesPath, CompressedJsonFileName);
         CreateDynamicClassesForJsonObject(JsonObject);
     }
 }
@@ -654,6 +671,37 @@ UEnum* FSuziePluginModule::FindOrCreateEnum(FDynamicClassGenerationContext& Cont
     return NewEnum;
 }
 
+// Note that only flags that are set manually (e.g. non-computed flags) should be listed here
+static const TArray<TPair<FString, EFunctionFlags>> FunctionFlagNameLookup = {
+    {TEXT("FUNC_Final"), FUNC_Final},
+    {TEXT("FUNC_BlueprintAuthorityOnly"), FUNC_BlueprintAuthorityOnly},
+    {TEXT("FUNC_BlueprintCosmetic"), FUNC_BlueprintCosmetic},
+    {TEXT("FUNC_Net"), FUNC_Net},
+    {TEXT("FUNC_NetReliable"), FUNC_NetReliable},
+    {TEXT("FUNC_NetRequest"), FUNC_NetRequest},
+    {TEXT("FUNC_Exec"), FUNC_Exec},
+    {TEXT("FUNC_Event"), FUNC_Event},
+    {TEXT("FUNC_NetResponse"), FUNC_NetResponse},
+    {TEXT("FUNC_Static"), FUNC_Static},
+    {TEXT("FUNC_NetMulticast"), FUNC_NetMulticast},
+    {TEXT("FUNC_UbergraphFunction"), FUNC_UbergraphFunction},
+    {TEXT("FUNC_MulticastDelegate"), FUNC_MulticastDelegate},
+    {TEXT("FUNC_Public"), FUNC_Public},
+    {TEXT("FUNC_Private"), FUNC_Private},
+    {TEXT("FUNC_Protected"), FUNC_Protected},
+    {TEXT("FUNC_Delegate"), FUNC_Delegate},
+    {TEXT("FUNC_NetServer"), FUNC_NetServer},
+    {TEXT("FUNC_NetClient"), FUNC_NetClient},
+    {TEXT("FUNC_BlueprintCallable"), FUNC_BlueprintCallable},
+    {TEXT("FUNC_BlueprintEvent"), FUNC_BlueprintEvent},
+    {TEXT("FUNC_BlueprintPure"), FUNC_BlueprintPure},
+    {TEXT("FUNC_EditorOnly"), FUNC_EditorOnly},
+    {TEXT("FUNC_Const"), FUNC_Const},
+    {TEXT("FUNC_NetValidate"), FUNC_NetValidate},
+    {TEXT("FUNC_HasOutParms"), FUNC_HasOutParms},
+    {TEXT("FUNC_HasDefaults"), FUNC_HasDefaults},
+};
+
 UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationContext& Context, const FString& FunctionPath)
 {
     if (FunctionPath.IsEmpty()) return nullptr;
@@ -687,37 +735,6 @@ UFunction* FSuziePluginModule::FindOrCreateFunction(FDynamicClassGenerationConte
     {
         return ExistingFunction;
     }
-
-    // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EFunctionFlags>> FunctionFlagNameLookup = {
-        {TEXT("FUNC_Final"), FUNC_Final},
-        {TEXT("FUNC_BlueprintAuthorityOnly"), FUNC_BlueprintAuthorityOnly},
-        {TEXT("FUNC_BlueprintCosmetic"), FUNC_BlueprintCosmetic},
-        {TEXT("FUNC_Net"), FUNC_Net},
-        {TEXT("FUNC_NetReliable"), FUNC_NetReliable},
-        {TEXT("FUNC_NetRequest"), FUNC_NetRequest},
-        {TEXT("FUNC_Exec"), FUNC_Exec},
-        {TEXT("FUNC_Event"), FUNC_Event},
-        {TEXT("FUNC_NetResponse"), FUNC_NetResponse},
-        {TEXT("FUNC_Static"), FUNC_Static},
-        {TEXT("FUNC_NetMulticast"), FUNC_NetMulticast},
-        {TEXT("FUNC_UbergraphFunction"), FUNC_UbergraphFunction},
-        {TEXT("FUNC_MulticastDelegate"), FUNC_MulticastDelegate},
-        {TEXT("FUNC_Public"), FUNC_Public},
-        {TEXT("FUNC_Private"), FUNC_Private},
-        {TEXT("FUNC_Protected"), FUNC_Protected},
-        {TEXT("FUNC_Delegate"), FUNC_Delegate},
-        {TEXT("FUNC_NetServer"), FUNC_NetServer},
-        {TEXT("FUNC_NetClient"), FUNC_NetClient},
-        {TEXT("FUNC_BlueprintCallable"), FUNC_BlueprintCallable},
-        {TEXT("FUNC_BlueprintEvent"), FUNC_BlueprintEvent},
-        {TEXT("FUNC_BlueprintPure"), FUNC_BlueprintPure},
-        {TEXT("FUNC_EditorOnly"), FUNC_EditorOnly},
-        {TEXT("FUNC_Const"), FUNC_Const},
-        {TEXT("FUNC_NetValidate"), FUNC_NetValidate},
-        {TEXT("FUNC_HasOutParms"), FUNC_HasOutParms},
-        {TEXT("FUNC_HasDefaults"), FUNC_HasDefaults},
-    };
 
     const TSharedPtr<FJsonObject> FunctionDefinition = Context.GlobalObjectMap->GetObjectField(FunctionPath);
     checkf(FunctionDefinition.IsValid(), TEXT("Failed to find function object by path %s"), *FunctionPath);
@@ -875,71 +892,71 @@ void FSuziePluginModule::AddFunctionToClass(FDynamicClassGenerationContext& Cont
     }
 }
 
-FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags)
-{
-    // Note that only flags that are set manually (e.g. non-computed flags) should be listed here
-    static const TArray<TPair<FString, EPropertyFlags>> PropertyFlagNameLookup = {
-        {TEXT("CPF_Edit"), CPF_Edit},
-        {TEXT("CPF_ConstParm"), CPF_ConstParm},
-        {TEXT("CPF_BlueprintVisible"), CPF_BlueprintVisible},
-        {TEXT("CPF_ExportObject"), CPF_ExportObject},
-        {TEXT("CPF_BlueprintReadOnly"), CPF_BlueprintReadOnly},
-        {TEXT("CPF_Net"), CPF_Net},
-        {TEXT("CPF_EditFixedSize"), CPF_EditFixedSize},
-        {TEXT("CPF_Parm"), CPF_Parm},
-        {TEXT("CPF_OutParm"), CPF_OutParm},
-        {TEXT("CPF_ReturnParm"), CPF_ReturnParm},
-        {TEXT("CPF_DisableEditOnTemplate"), CPF_DisableEditOnTemplate},
-        {TEXT("CPF_NonNullable"), CPF_NonNullable},
-        {TEXT("CPF_Transient"), CPF_Transient},
-        {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
-        {TEXT("CPF_EditConst"), CPF_EditConst},
-        {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
-        {TEXT("CPF_InstancedReference"), CPF_InstancedReference},
-        {TEXT("CPF_DuplicateTransient"), CPF_DuplicateTransient},
-        {TEXT("CPF_SaveGame"), CPF_SaveGame},
-        {TEXT("CPF_NoClear"), CPF_NoClear},
-        {TEXT("CPF_SaveGame"), CPF_SaveGame},
-        {TEXT("CPF_ReferenceParm"), CPF_ReferenceParm},
-        {TEXT("CPF_BlueprintAssignable"), CPF_BlueprintAssignable},
-        {TEXT("CPF_Deprecated"), CPF_Deprecated},
-        {TEXT("CPF_RepSkip"), CPF_RepSkip},
-        {TEXT("CPF_Deprecated"), CPF_Deprecated},
-        {TEXT("CPF_RepNotify"), CPF_RepNotify},
-        {TEXT("CPF_Interp"), CPF_Interp},
-        {TEXT("CPF_NonTransactional"), CPF_NonTransactional},
-        {TEXT("CPF_EditorOnly"), CPF_EditorOnly},
-        {TEXT("CPF_AutoWeak"), CPF_AutoWeak},
-        // CPF_ContainsInstancedReference is actually computed, but it is set by the compiler and not in runtime,
-        // so we need to either carry it over (like we do here), or manually set it on container properties when their
-        // elements have CPF_ContainsInstancedReference
-        {TEXT("CPF_ContainsInstancedReference"), CPF_ContainsInstancedReference},
-        {TEXT("CPF_AssetRegistrySearchable"), CPF_AssetRegistrySearchable},
-        {TEXT("CPF_SimpleDisplay"), CPF_SimpleDisplay},
-        {TEXT("CPF_AdvancedDisplay"), CPF_AdvancedDisplay},
-        {TEXT("CPF_Protected"), CPF_Protected},
-        {TEXT("CPF_BlueprintCallable"), CPF_BlueprintCallable},
-        {TEXT("CPF_BlueprintAuthorityOnly"), CPF_BlueprintAuthorityOnly},
-        {TEXT("CPF_TextExportTransient"), CPF_TextExportTransient},
-        {TEXT("CPF_NonPIEDuplicateTransient"), CPF_NonPIEDuplicateTransient},
-        {TEXT("CPF_PersistentInstance"), CPF_PersistentInstance},
-        {TEXT("CPF_UObjectWrapper"), CPF_UObjectWrapper},
-        {TEXT("CPF_NativeAccessSpecifierPublic"), CPF_NativeAccessSpecifierPublic},
-        {TEXT("CPF_NativeAccessSpecifierProtected"), CPF_NativeAccessSpecifierProtected},
-        {TEXT("CPF_NativeAccessSpecifierPrivate"), CPF_NativeAccessSpecifierPrivate},
-        {TEXT("CPF_SkipSerialization"), CPF_SkipSerialization},
+// Note that only flags that are set manually (e.g. non-computed flags) should be listed here
+static const TArray<TPair<FString, EPropertyFlags>> PropertyFlagNameLookup = {
+    {TEXT("CPF_Edit"), CPF_Edit},
+    {TEXT("CPF_ConstParm"), CPF_ConstParm},
+    {TEXT("CPF_BlueprintVisible"), CPF_BlueprintVisible},
+    {TEXT("CPF_ExportObject"), CPF_ExportObject},
+    {TEXT("CPF_BlueprintReadOnly"), CPF_BlueprintReadOnly},
+    {TEXT("CPF_Net"), CPF_Net},
+    {TEXT("CPF_EditFixedSize"), CPF_EditFixedSize},
+    {TEXT("CPF_Parm"), CPF_Parm},
+    {TEXT("CPF_OutParm"), CPF_OutParm},
+    {TEXT("CPF_ReturnParm"), CPF_ReturnParm},
+    {TEXT("CPF_DisableEditOnTemplate"), CPF_DisableEditOnTemplate},
+    {TEXT("CPF_NonNullable"), CPF_NonNullable},
+    {TEXT("CPF_Transient"), CPF_Transient},
+    {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
+    {TEXT("CPF_EditConst"), CPF_EditConst},
+    {TEXT("CPF_DisableEditOnInstance"), CPF_DisableEditOnInstance},
+    {TEXT("CPF_InstancedReference"), CPF_InstancedReference},
+    {TEXT("CPF_DuplicateTransient"), CPF_DuplicateTransient},
+    {TEXT("CPF_SaveGame"), CPF_SaveGame},
+    {TEXT("CPF_NoClear"), CPF_NoClear},
+    {TEXT("CPF_SaveGame"), CPF_SaveGame},
+    {TEXT("CPF_ReferenceParm"), CPF_ReferenceParm},
+    {TEXT("CPF_BlueprintAssignable"), CPF_BlueprintAssignable},
+    {TEXT("CPF_Deprecated"), CPF_Deprecated},
+    {TEXT("CPF_RepSkip"), CPF_RepSkip},
+    {TEXT("CPF_Deprecated"), CPF_Deprecated},
+    {TEXT("CPF_RepNotify"), CPF_RepNotify},
+    {TEXT("CPF_Interp"), CPF_Interp},
+    {TEXT("CPF_NonTransactional"), CPF_NonTransactional},
+    {TEXT("CPF_EditorOnly"), CPF_EditorOnly},
+    {TEXT("CPF_AutoWeak"), CPF_AutoWeak},
+    // CPF_ContainsInstancedReference is actually computed, but it is set by the compiler and not in runtime,
+    // so we need to either carry it over (like we do here), or manually set it on container properties when their
+    // elements have CPF_ContainsInstancedReference
+    {TEXT("CPF_ContainsInstancedReference"), CPF_ContainsInstancedReference},
+    {TEXT("CPF_AssetRegistrySearchable"), CPF_AssetRegistrySearchable},
+    {TEXT("CPF_SimpleDisplay"), CPF_SimpleDisplay},
+    {TEXT("CPF_AdvancedDisplay"), CPF_AdvancedDisplay},
+    {TEXT("CPF_Protected"), CPF_Protected},
+    {TEXT("CPF_BlueprintCallable"), CPF_BlueprintCallable},
+    {TEXT("CPF_BlueprintAuthorityOnly"), CPF_BlueprintAuthorityOnly},
+    {TEXT("CPF_TextExportTransient"), CPF_TextExportTransient},
+    {TEXT("CPF_NonPIEDuplicateTransient"), CPF_NonPIEDuplicateTransient},
+    {TEXT("CPF_PersistentInstance"), CPF_PersistentInstance},
+    {TEXT("CPF_UObjectWrapper"), CPF_UObjectWrapper},
+    {TEXT("CPF_NativeAccessSpecifierPublic"), CPF_NativeAccessSpecifierPublic},
+    {TEXT("CPF_NativeAccessSpecifierProtected"), CPF_NativeAccessSpecifierProtected},
+    {TEXT("CPF_NativeAccessSpecifierPrivate"), CPF_NativeAccessSpecifierPrivate},
+    {TEXT("CPF_SkipSerialization"), CPF_SkipSerialization},
 #if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 5)
-        // Added in 5.5, allows references to the current object from within the property
-        {TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference},
+    // Added in 5.5, allows references to the current object from within the property
+    {TEXT("CPF_AllowSelfReference"), CPF_AllowSelfReference},
 #endif
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 6
-        {TEXT("CPF_RequiredParm"), CPF_RequiredParm},
-        {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
+    {TEXT("CPF_RequiredParm"), CPF_RequiredParm},
+    {TEXT("CPF_TObjectPtr"), CPF_TObjectPtr},
 #endif
-        // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
-        {TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash},
-    };
+    // This is set automatically for most property types, but Kismet Compiler also tags properties with this manually so carry over the flag just in case
+    {TEXT("CPF_HasGetValueTypeHash"), CPF_HasGetValueTypeHash},
+};
 
+FProperty* FSuziePluginModule::BuildProperty(FDynamicClassGenerationContext& Context, FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson, EPropertyFlags ExtraPropertyFlags)
+{
     // Convert struct flag names to the struct flags bitmask
     const TSet<FString> PropertyFlagNames = ParseFlags(PropertyJson->GetStringField(TEXT("flags")));
     EPropertyFlags PropertyFlags = ExtraPropertyFlags;
@@ -1614,6 +1631,261 @@ void FSuziePluginModule::FinalizeClass(FDynamicClassGenerationContext& Context, 
         ClassConstructionData.DefaultObjectArchetype->SetFlags(RF_Public | RF_ArchetypeObject | RF_Transactional);
         ClassConstructionData.DefaultObjectArchetype->AddToRoot();
     }
+}
+
+FString GetJmapOverridesFileName(const FString& JmapFileName)
+{
+    FString BaseName = JmapFileName;
+    BaseName.RemoveFromEnd(TEXT(".gz"));
+    BaseName.RemoveFromEnd(TEXT(".jmap"));
+    return BaseName + TEXT(".overrides.json");
+}
+
+static TArray<FString> SplitFlags(const FString& Flags)
+{
+    TArray<FString> FlagNames;
+    Flags.ParseIntoArray(FlagNames, TEXT("|"), true);
+    for (FString& FlagName : FlagNames)
+    {
+        FlagName.TrimStartAndEndInline();
+    }
+    FlagNames.RemoveAll([](const FString& FlagName) { return FlagName.IsEmpty(); });
+    return FlagNames;
+}
+
+static TSharedPtr<FJsonObject> LoadJmapOverrides(const FString& OverridesPath)
+{
+    FString OverridesContent;
+    TSharedPtr<FJsonObject> Overrides;
+    if (!FFileHelper::LoadFileToString(OverridesContent, *OverridesPath) ||
+        !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(OverridesContent), Overrides) || !Overrides.IsValid())
+    {
+        return nullptr;
+    }
+    return Overrides;
+}
+
+// FString keys of a TMap compare without case, as FNames do
+static TMap<FString, TSharedPtr<FJsonObject>> IndexJmapObjects(const TSharedPtr<FJsonObject>& Objects)
+{
+    TMap<FString, TSharedPtr<FJsonObject>> ObjectsByPath;
+    for (auto It = Objects->Values.CreateConstIterator(); It; ++It)
+    {
+        const TSharedPtr<FJsonObject>* Object = nullptr;
+        if (It.Value()->TryGetObject(Object))
+        {
+            ObjectsByPath.Add(FString(*It.Key()), *Object);
+        }
+    }
+    return ObjectsByPath;
+}
+
+static bool ReadOverrideNames(const TSharedPtr<FJsonValue>& Value, TArray<FString>& OutNames)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+    if (!Value->TryGetArray(Values) || Values->IsEmpty())
+    {
+        return false;
+    }
+    for (const TSharedPtr<FJsonValue>& Item : *Values)
+    {
+        FString Name;
+        if (!Item->TryGetString(Name))
+        {
+            return false;
+        }
+        OutNames.Add(Name);
+    }
+    return true;
+}
+
+static TSharedPtr<FJsonObject> FindJmapProperty(const TSharedPtr<FJsonObject>& Owner, const FString& PropertyName)
+{
+    const TArray<TSharedPtr<FJsonValue>>* Properties = nullptr;
+    if (!Owner->TryGetArrayField(TEXT("properties"), Properties))
+    {
+        return nullptr;
+    }
+    for (const TSharedPtr<FJsonValue>& Value : *Properties)
+    {
+        const TSharedPtr<FJsonObject>* Property = nullptr;
+        FString Name;
+        if (Value->TryGetObject(Property) && (*Property)->TryGetStringField(TEXT("name"), Name) && Name.Equals(PropertyName, ESearchCase::IgnoreCase))
+        {
+            return *Property;
+        }
+    }
+    return nullptr;
+}
+
+static TSharedPtr<FJsonObject> FindJmapFunction(const TMap<FString, TSharedPtr<FJsonObject>>& ObjectsByPath, const FString& OwnerPath, const FString& FunctionName)
+{
+    const TSharedPtr<FJsonObject>* Function = ObjectsByPath.Find(OwnerPath + TEXT(":") + FunctionName);
+    if (Function == nullptr || (*Function)->GetStringField(TEXT("type")) != TEXT("Function"))
+    {
+        return nullptr;
+    }
+    return *Function;
+}
+
+template <typename TFlags>
+static FString OverrideFlags(const TSharedPtr<FJsonObject>& Member, const TCHAR* FlagsField, const TArray<TPair<FString, TFlags>>& KnownFlags, const TCHAR* Kind, const TArray<FString>& Names, bool bClear)
+{
+    for (const FString& Name : Names)
+    {
+        if (!KnownFlags.ContainsByPredicate([&](const TPair<FString, TFlags>& Known) { return Known.Key == Name; }))
+        {
+            return FString::Printf(TEXT("%s is not a %s flag Suzie knows"), *Name, Kind);
+        }
+    }
+    TArray<FString> Flags = SplitFlags(Member->GetStringField(FlagsField));
+    for (const FString& Name : Names)
+    {
+        if (Flags.Contains(Name) != bClear)
+        {
+            return bClear ? FString::Printf(TEXT("it does not have %s"), *Name) : FString::Printf(TEXT("it already has %s"), *Name);
+        }
+    }
+    if (bClear)
+    {
+        Flags.RemoveAll([&](const FString& Flag) { return Names.Contains(Flag); });
+    }
+    else
+    {
+        Flags.Append(Names);
+    }
+    Member->SetStringField(FlagsField, FString::Join(Flags, TEXT(" | ")));
+    return FString();
+}
+
+static FString RetypeProperty(const TSharedPtr<FJsonObject>& Property, const TArray<FString>& Types)
+{
+    static const TArray<TPair<FString, int64>> WiderTypes = {{TEXT("IntProperty"), 4}, {TEXT("Int64Property"), 8}};
+    if (Types.Num() != 2)
+    {
+        return TEXT("a retype names two types, the property's and the wider one");
+    }
+    const FString PropertyType = Property->GetStringField(TEXT("type"));
+    if (PropertyType != Types[0])
+    {
+        return FString::Printf(TEXT("the property is a %s, not a %s"), *PropertyType, *Types[0]);
+    }
+    const TPair<FString, int64>* Wider = WiderTypes.FindByPredicate([&](const TPair<FString, int64>& Type) { return Type.Key == Types[1]; });
+    if (Wider == nullptr)
+    {
+        return FString::Printf(TEXT("a retype only widens, to IntProperty or Int64Property, not to %s"), *Types[1]);
+    }
+    int64 PropertySize = 0;
+    if (!Property->TryGetNumberField(TEXT("size"), PropertySize))
+    {
+        return TEXT("the property has no size");
+    }
+    if (Wider->Value < PropertySize)
+    {
+        return FString::Printf(TEXT("%s is narrower than the %lld bytes the property holds"), *Types[1], PropertySize);
+    }
+    Property->SetStringField(TEXT("type"), Types[1]);
+    Property->SetNumberField(TEXT("size"), static_cast<double>(Wider->Value));
+    return FString();
+}
+
+static FString ApplyJmapOverride(const TMap<FString, TSharedPtr<FJsonObject>>& ObjectsByPath, const FString& Section, const FString& OwnerPath, const FString& MemberName, const TSharedPtr<FJsonValue>& Value)
+{
+    TArray<FString> Names;
+    if (!ReadOverrideNames(Value, Names))
+    {
+        return TEXT("it is not a list of names");
+    }
+    const TSharedPtr<FJsonObject>* Owner = ObjectsByPath.Find(OwnerPath);
+    if (Owner == nullptr)
+    {
+        return FString::Printf(TEXT("the jmap has no %s"), *OwnerPath);
+    }
+    if (Section != TEXT("retype") && Names[0].StartsWith(TEXT("FUNC_")))
+    {
+        const TSharedPtr<FJsonObject> Function = FindJmapFunction(ObjectsByPath, OwnerPath, MemberName);
+        if (!Function)
+        {
+            return FString::Printf(TEXT("the jmap has no function %s:%s"), *OwnerPath, *MemberName);
+        }
+        return OverrideFlags(Function, TEXT("function_flags"), FunctionFlagNameLookup, TEXT("function"), Names, Section == TEXT("clear_flags"));
+    }
+    const TSharedPtr<FJsonObject> Property = FindJmapProperty(*Owner, MemberName);
+    if (!Property)
+    {
+        return FString::Printf(TEXT("%s has no property %s"), *OwnerPath, *MemberName);
+    }
+    if (Section == TEXT("retype"))
+    {
+        return RetypeProperty(Property, Names);
+    }
+    return OverrideFlags(Property, TEXT("flags"), PropertyFlagNameLookup, TEXT("property"), Names, Section == TEXT("clear_flags"));
+}
+
+void ApplyJmapOverrides(const TSharedPtr<FJsonObject>& RootObject, const FString& JsonClassesPath, const FString& JmapFileName)
+{
+    const FString OverridesFileName = GetJmapOverridesFileName(JmapFileName);
+    const FString OverridesPath = JsonClassesPath / OverridesFileName;
+    if (!FPaths::FileExists(OverridesPath))
+    {
+        return;
+    }
+    const TSharedPtr<FJsonObject> Overrides = LoadJmapOverrides(OverridesPath);
+    if (!Overrides)
+    {
+        UE_LOG(LogSuzie, Error, TEXT("Failed to read jmap overrides file %s as JSON, so none of its overrides were applied"), *OverridesFileName);
+        return;
+    }
+    const TSharedPtr<FJsonObject>* Objects = nullptr;
+    if (!RootObject->TryGetObjectField(TEXT("objects"), Objects))
+    {
+        return;
+    }
+    const TMap<FString, TSharedPtr<FJsonObject>> ObjectsByPath = IndexJmapObjects(*Objects);
+
+    int32 NumOverrides = 0;
+    int32 NumApplied = 0;
+    for (auto SectionIt = Overrides->Values.CreateConstIterator(); SectionIt; ++SectionIt)
+    {
+        const FString Section = FString(*SectionIt.Key());
+        if (Section != TEXT("clear_flags") && Section != TEXT("set_flags") && Section != TEXT("retype"))
+        {
+            UE_LOG(LogSuzie, Error, TEXT("Jmap overrides file %s has an unknown section %s, which was not applied"), *OverridesFileName, *Section);
+            continue;
+        }
+        const TSharedPtr<FJsonObject>* Owners = nullptr;
+        if (!SectionIt.Value()->TryGetObject(Owners))
+        {
+            UE_LOG(LogSuzie, Error, TEXT("Jmap overrides file %s: %s is not an object of owners, so it was not applied"), *OverridesFileName, *Section);
+            continue;
+        }
+        for (auto OwnerIt = (*Owners)->Values.CreateConstIterator(); OwnerIt; ++OwnerIt)
+        {
+            const FString OwnerPath = FString(*OwnerIt.Key());
+            const TSharedPtr<FJsonObject>* Members = nullptr;
+            if (!OwnerIt.Value()->TryGetObject(Members))
+            {
+                ++NumOverrides;
+                UE_LOG(LogSuzie, Error, TEXT("Jmap override %s of %s is not an object of members, so it was not applied"), *Section, *OwnerPath);
+                continue;
+            }
+            for (auto MemberIt = (*Members)->Values.CreateConstIterator(); MemberIt; ++MemberIt)
+            {
+                ++NumOverrides;
+                const FString MemberName = FString(*MemberIt.Key());
+                const FString Error = ApplyJmapOverride(ObjectsByPath, Section, OwnerPath, MemberName, MemberIt.Value());
+                if (Error.IsEmpty())
+                {
+                    ++NumApplied;
+                }
+                else
+                {
+                    UE_LOG(LogSuzie, Error, TEXT("Jmap override %s %s.%s was not applied: %s"), *Section, *OwnerPath, *MemberName, *Error);
+                }
+            }
+        }
+    }
+    UE_LOG(LogSuzie, Display, TEXT("Jmap overrides: %d of %d applied to %s from %s"), NumApplied, NumOverrides, *JmapFileName, *OverridesFileName);
 }
 
 #undef LOCTEXT_NAMESPACE
